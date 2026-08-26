@@ -87,6 +87,41 @@ app/
 └── __init__.py
 ```
 
+## Quick start
+
+The project includes setup scripts for both macOS/Linux and Windows so you can get the app running with minimal manual work.
+
+### macOS / Linux
+
+```bash
+chmod +x scripts/setup.sh scripts/start.sh
+./scripts/setup.sh
+./scripts/start.sh
+```
+
+### Windows (PowerShell)
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+./scripts/setup.ps1
+./scripts/start.ps1
+```
+
+### Manual setup
+
+If you want to do it step by step instead of using the scripts:
+
+```bash
+cp .env.example .env
+python3 -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+docker compose up -d
+python -m alembic upgrade head
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
 ## Environment setup
 
 Copy the sample environment file and adjust values:
@@ -120,6 +155,20 @@ alembic upgrade head
 ### 3) Start the API
 
 ```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### On Windows PowerShell
+
+```powershell
+. .\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### On macOS/Linux
+
+```bash
+source .venv/bin/activate
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
