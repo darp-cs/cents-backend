@@ -1,4 +1,13 @@
 from typing import Literal
+import warnings
+
+from langchain_core._api.deprecation import LangChainPendingDeprecationWarning
+
+warnings.filterwarnings(
+    "ignore",
+    message="The default value of `allowed_objects` will change in a future version.*",
+    category=LangChainPendingDeprecationWarning,
+)
 
 from langgraph.graph import END, StateGraph
 
@@ -57,5 +66,6 @@ app_graph = None
 async def get_graph():
     global app_graph
     if app_graph is None:
-        app_graph = workflow.compile(checkpointer=await ensure_checkpointer_ready())
+        checkpointer = await ensure_checkpointer_ready()
+        app_graph = workflow.compile(checkpointer=checkpointer) if checkpointer is not None else workflow.compile()
     return app_graph

@@ -1,5 +1,10 @@
 .venv/
 __pycache__/
 *.pyc
-.env
+# .env is committed intentionally — update values before running
 .pytest_cache/
+.chroma/
+cents.db
+*.log
+verify_startup.py
+test_runner.py

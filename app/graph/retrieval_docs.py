@@ -1,5 +1,6 @@
 from app.config import settings
 from app.graph.state import GraphState
+from app.vector_store import query_documents
 
 
 def document_retrieval_node(state: GraphState) -> GraphState:
@@ -9,18 +10,17 @@ def document_retrieval_node(state: GraphState) -> GraphState:
             query_text = str(message.get("content", ""))
             break
 
-    # TODO: model config -> generate a document embedding from query_text, output vector of length VECTOR_DIMENSION.
+    # TODO: model config -> generate a document embedding from query_text.
     query_embedding = [0.0 for _ in range(settings.vector_dimension)]
-
-    # Example pgvector query scoped by user_id:
-    # SELECT id, source_filename, chunk_text, 1 - (embedding <=> :query_embedding) AS similarity
-    # FROM documents WHERE user_id = :user_id ORDER BY embedding <=> :query_embedding LIMIT 5;
+    user_id = str(state.get("user_id", ""))
+    docs = query_documents(user_id=user_id, query_embedding=query_embedding, limit=5)
     state["retrieved_docs"] = [
         {
-            "chunk_text": "Relevant document context for the user query.",
-            "source_filename": "placeholder.txt",
-            "similarity": 0.88,
+            "chunk_text": item["chunk_text"],
+            "source_filename": item["source_filename"],
+            "similarity": item["similarity"],
             "query": query_text,
         }
+        for item in docs
     ]
     return state

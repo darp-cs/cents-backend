@@ -6,9 +6,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.users import current_active_user
-from app.config import settings
 from app.db.base import AsyncSessionLocal
 from app.db.models import ToolDefinition, User
+from app.vector_store import upsert_tool
 
 router = APIRouter()
 
@@ -44,11 +44,9 @@ async def register_tool(
     if not payload.name or not payload.description:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Name and description are required")
 
-    # TODO: model config -> generate embedding from the tool description, output list[float] of length VECTOR_DIMENSION.
-    tool_embedding = [0.0 for _ in range(settings.vector_dimension)]
-
-    tool = ToolDefinition(name=payload.name, description=payload.description, embedding=tool_embedding)
+    tool = ToolDefinition(name=payload.name, description=payload.description)
     session.add(tool)
     await session.commit()
     await session.refresh(tool)
+    upsert_tool(str(tool.id), tool.name, tool.description)
     return {"id": str(tool.id), "name": tool.name, "description": tool.description}

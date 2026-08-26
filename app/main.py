@@ -3,19 +3,21 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth.users import auth_router, register_router, user_router
 from app.config import settings
-from app.graph.checkpointer import ensure_checkpointer_ready
+from app.db.base import init_db
 from app.graph.graph import get_graph
 from app.routes.chat import router as chat_router
 from app.routes.conversations import router as conversations_router
 from app.routes.documents import router as documents_router
 from app.routes.tools import router as tools_router
+from app.vector_store import ensure_vector_store_ready
 
 app = FastAPI(title=settings.app_name, version="0.1.0")
 
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    await ensure_checkpointer_ready()
+    await init_db()
+    ensure_vector_store_ready()
     await get_graph()
 
 

@@ -2,14 +2,13 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from pgvector.sqlalchemy import Vector
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.users import current_active_user
-from app.config import settings
 from app.db.base import AsyncSessionLocal
 from app.db.models import Document, User
+from app.vector_store import upsert_documents
 
 router = APIRouter()
 
@@ -21,8 +20,8 @@ async def get_db_session() -> AsyncSession:
 
 @router.post("/upload", response_model=dict)
 async def upload_document(
-    file: UploadFile = File(...),
     user: Annotated[User, Depends(current_active_user)],
+    file: UploadFile = File(...),
     session: AsyncSession = Depends(get_db_session),
 ):
     if not file.filename:
@@ -35,21 +34,25 @@ async def upload_document(
     if not chunks:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No text found in document")
 
-    # TODO: model config -> generate embedding for a chunk or combined document text, output list[float] with VECTOR_DIMENSION length.
-    placeholder_embedding = [0.0 for _ in range(settings.vector_dimension)]
     stored = []
+    chroma_items: list[tuple[str, str]] = []
 
     for chunk in chunks:
+        doc_id = uuid.uuid4()
+        chunk_text = chunk[:4000]
         doc = Document(
+            id=doc_id,
             user_id=user.id,
             source_filename=file.filename,
-            chunk_text=chunk[:4000],
-            embedding=placeholder_embedding,
+            chunk_text=chunk_text,
         )
         session.add(doc)
-        stored.append({"id": str(doc.id), "source_filename": file.filename, "chunk_text": chunk[:4000]})
+        doc_id_str = str(doc_id)
+        chroma_items.append((doc_id_str, chunk_text))
+        stored.append({"id": doc_id_str, "source_filename": file.filename, "chunk_text": chunk_text})
 
     await session.commit()
+    upsert_documents(str(user.id), file.filename, chroma_items)
     return {"status": "ok", "count": len(stored), "documents": stored}
 
 
