@@ -16,6 +16,16 @@ class Settings(BaseSettings):
     chroma_persist_directory: str = ".chroma"
     chroma_documents_collection: str = "documents"
     chroma_tools_collection: str = "tool_definitions"
+    llm_service_base_url: str = "http://127.0.0.1:8100"
+    llm_service_generate_path: str = "/v1/generate"
+    llm_service_models_path: str = "/v1/models"
+    llm_service_api_key: str = ""
+    llm_service_timeout_seconds: int = Field(default=120, ge=5, le=600)
+    llm_default_chat_model: str = "qwen2.5:3b-instruct"
+    llm_default_judge_model: str = "qwen2.5:3b-instruct"
+    llm_judge_enabled: bool = False
+    llm_default_temperature: float = Field(default=0.3, ge=0.0, le=2.0)
+    llm_default_max_tokens: int = Field(default=512, ge=1, le=4096)
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

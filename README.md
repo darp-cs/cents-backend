@@ -149,8 +149,77 @@ Important variables:
 - CHROMA_PERSIST_DIRECTORY
 - CHROMA_DOCUMENTS_COLLECTION
 - CHROMA_TOOLS_COLLECTION
+- LLM_SERVICE_BASE_URL
+- LLM_SERVICE_GENERATE_PATH
+- LLM_SERVICE_MODELS_PATH
+- LLM_SERVICE_API_KEY
+- LLM_SERVICE_TIMEOUT_SECONDS
+- LLM_DEFAULT_CHAT_MODEL
+- LLM_DEFAULT_JUDGE_MODEL
+- LLM_JUDGE_ENABLED
+- LLM_DEFAULT_TEMPERATURE
+- LLM_DEFAULT_MAX_TOKENS
 
 Default local values already target SQLite + Chroma.
+
+## LLM Service Dependency
+
+`cents-backend` now delegates generation calls to the sibling `cents-llm` service.
+
+Recommended local run order:
+
+1. Start Ollama and pull a starter model (for example `qwen2.5:3b-instruct`).
+2. Start `cents-llm` on `http://127.0.0.1:8100`.
+3. Start `cents-backend`.
+
+If `LLM_SERVICE_API_KEY` is configured in `cents-llm`, set the same value in backend `.env`.
+
+## Multi-model Routing
+
+The backend can use different models per conversation and per graph node.
+
+### Get available models
+
+- `GET /chat/models`
+- Requires auth
+- Returns model list from `cents-llm` plus backend defaults and supported node keys.
+
+### Set conversation model config
+
+- `GET /conversations/{conversation_id}/model-config`
+- `PUT /conversations/{conversation_id}/model-config`
+
+Payload shape for `PUT`:
+
+```json
+{
+    "default_model": "qwen2.5:3b-instruct",
+    "node_models": {
+        "generation": "qwen2.5:3b-instruct",
+        "judge": "llama3.2:3b-instruct"
+    }
+}
+```
+
+### Per-request model override
+
+`POST /chat` accepts optional fields:
+
+- `model`: overrides default model for that request
+- `node_models`: per-node model override map for that request
+
+Request body example:
+
+```json
+{
+    "conversation_id": "...",
+    "message": "Summarize the latest updates",
+    "model": "qwen2.5:3b-instruct",
+    "node_models": {
+        "judge": "llama3.2:3b-instruct"
+    }
+}
+```
 
 ## Notes
 
