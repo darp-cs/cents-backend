@@ -99,12 +99,11 @@ chmod +x scripts/setup.sh scripts/start.sh
 ./scripts/start.sh
 ```
 
-### Windows (PowerShell)
+### Windows (cmd)
 
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-./scripts/setup.ps1
-./scripts/start.ps1
+```cmd
+scripts\setup.bat
+scripts\start.bat
 ```
 
 ### Manual setup
@@ -158,10 +157,10 @@ alembic upgrade head
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### On Windows PowerShell
+### On Windows cmd
 
-```powershell
-. .\.venv\Scripts\Activate.ps1
+```cmd
+.venv\Scripts\activate.bat
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
