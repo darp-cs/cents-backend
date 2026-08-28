@@ -20,7 +20,7 @@ SUPPORTED_LLM_NODES = ("generation", "judge")
 
 
 class NodeLLMConfigPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     model_type: str = Field(min_length=1)
     model: str | None = None
