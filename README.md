@@ -154,7 +154,9 @@ Important variables:
 - LLM_SERVICE_MODELS_PATH
 - LLM_SERVICE_API_KEY
 - LLM_SERVICE_TIMEOUT_SECONDS
-- LLM_DEFAULT_CHAT_MODEL
+- LLM_DEFAULT_GENERATION_MODEL_TYPE
+- LLM_DEFAULT_GENERATION_MODEL
+- LLM_DEFAULT_JUDGE_MODEL_TYPE
 - LLM_DEFAULT_JUDGE_MODEL
 - LLM_JUDGE_ENABLED
 - LLM_DEFAULT_TEMPERATURE
@@ -193,10 +195,14 @@ Payload shape for `PUT`:
 
 ```json
 {
-    "default_model": "qwen2.5:3b-instruct",
-    "node_models": {
-        "generation": "qwen2.5:3b-instruct",
-        "judge": "llama3.2:3b-instruct"
+    "node_llm_configs": {
+        "generation": {
+            "model_type": "text-generation",
+            "model": "qwen2.5:3b-instruct"
+        },
+        "judge": {
+            "model_type": "reasoning"
+        }
     }
 }
 ```
@@ -205,8 +211,7 @@ Payload shape for `PUT`:
 
 `POST /chat` accepts optional fields:
 
-- `model`: overrides default model for that request
-- `node_models`: per-node model override map for that request
+- `node_llm_configs`: per-node map where each entry includes required `model_type` and optional `model`
 
 Request body example:
 
@@ -214,12 +219,22 @@ Request body example:
 {
     "conversation_id": "...",
     "message": "Summarize the latest updates",
-    "model": "qwen2.5:3b-instruct",
-    "node_models": {
-        "judge": "llama3.2:3b-instruct"
+    "node_llm_configs": {
+        "generation": {
+            "model_type": "text-generation"
+        },
+        "judge": {
+            "model_type": "reasoning",
+            "model": "llama3.2:3b-instruct"
+        }
     }
 }
 ```
+
+Rules:
+
+- For every node that triggers an LLM call, `model_type` is required.
+- `model` is optional per node. If omitted, `cents-llm` resolves the default model for that `model_type` folder.
 
 ## Notes
 

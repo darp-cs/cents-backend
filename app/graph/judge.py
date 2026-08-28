@@ -20,13 +20,26 @@ def _extract_context_summary(retrieved_docs: list[dict], retrieved_tools: list[d
     return f"Documents:\n{doc_text}\n\nTools: {tools_text}"
 
 
+def _resolve_judge_model_config(state: GraphState) -> tuple[str, str | None]:
+    node_llm_configs = state.get("node_llm_configs", {})
+    judge_config = node_llm_configs.get("judge", {})
+
+    model_type = str(judge_config.get("model_type", "")).strip()
+    if not model_type:
+        model_type = settings.llm_default_judge_model_type.strip()
+
+    if not model_type:
+        raise RuntimeError("Judge node model_type is required.")
+
+    model = str(judge_config.get("model", "")).strip() if judge_config.get("model") else ""
+    return model_type, (model or None)
+
+
 async def _llm_judge_verdict(state: GraphState) -> tuple[str, str]:
     generated_response = state.get("generated_response", "")
     retrieved_docs = state.get("retrieved_docs", [])
     retrieved_tools = state.get("retrieved_tools", [])
-    node_models = state.get("node_models", {})
-
-    selected_model = node_models.get("judge") or settings.llm_default_judge_model
+    model_type, selected_model = _resolve_judge_model_config(state)
     prompt = (
         "Evaluate whether the assistant response is acceptable given the retrieved context. "
         "Return strict JSON with keys verdict and reason. verdict must be pass or fail."
@@ -43,7 +56,7 @@ async def _llm_judge_verdict(state: GraphState) -> tuple[str, str]:
                 ),
             }
         ],
-        "model": selected_model,
+        "model_folder": model_type,
         "temperature": 0.0,
         "max_tokens": 160,
         "metadata": {
@@ -52,6 +65,9 @@ async def _llm_judge_verdict(state: GraphState) -> tuple[str, str]:
             "node": "judge",
         },
     }
+
+    if selected_model:
+        payload["model"] = selected_model
 
     response = await generate_text(payload)
     raw_text = str(response.get("text", "")).strip()

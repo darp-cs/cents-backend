@@ -21,8 +21,10 @@ class Settings(BaseSettings):
     llm_service_models_path: str = "/v1/models"
     llm_service_api_key: str = ""
     llm_service_timeout_seconds: int = Field(default=120, ge=5, le=600)
-    llm_default_chat_model: str = "qwen2.5:3b-instruct"
-    llm_default_judge_model: str = "qwen2.5:3b-instruct"
+    llm_default_generation_model_type: str = "text-generation"
+    llm_default_generation_model: str = ""
+    llm_default_judge_model_type: str = "reasoning"
+    llm_default_judge_model: str = ""
     llm_judge_enabled: bool = False
     llm_default_temperature: float = Field(default=0.3, ge=0.0, le=2.0)
     llm_default_max_tokens: int = Field(default=512, ge=1, le=4096)

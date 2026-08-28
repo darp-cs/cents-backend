@@ -30,6 +30,21 @@ def _normalize_messages(messages: list[dict]) -> list[dict[str, str]]:
     return normalized
 
 
+def _resolve_generation_model_config(state: GraphState) -> tuple[str, str | None]:
+    node_llm_configs = state.get("node_llm_configs", {})
+    generation_config = node_llm_configs.get("generation", {})
+
+    model_type = str(generation_config.get("model_type", "")).strip()
+    if not model_type:
+        model_type = settings.llm_default_generation_model_type.strip()
+
+    if not model_type:
+        raise RuntimeError("Generation node model_type is required.")
+
+    model = str(generation_config.get("model", "")).strip() if generation_config.get("model") else ""
+    return model_type, (model or None)
+
+
 async def generation_node(state: GraphState) -> GraphState:
     messages = list(state.get("messages", []))
     retrieved_docs = state.get("retrieved_docs", [])
@@ -42,17 +57,12 @@ async def generation_node(state: GraphState) -> GraphState:
         "Respond to the user using the conversation history and available context."
     )
 
-    node_models = state.get("node_models", {})
-    selected_model = (
-        node_models.get("generation")
-        or state.get("chat_model")
-        or settings.llm_default_chat_model
-    )
+    model_type, selected_model = _resolve_generation_model_config(state)
 
     request_payload = {
         "messages": _normalize_messages(messages),
         "system_prompt": system_prompt,
-        "model": selected_model,
+        "model_folder": model_type,
         "temperature": settings.llm_default_temperature,
         "max_tokens": settings.llm_default_max_tokens,
         "metadata": {
@@ -61,6 +71,9 @@ async def generation_node(state: GraphState) -> GraphState:
             "node": "generation",
         },
     }
+
+    if selected_model:
+        request_payload["model"] = selected_model
 
     try:
         payload = await generate_text(request_payload)

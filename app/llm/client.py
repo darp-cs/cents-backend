@@ -64,6 +64,37 @@ async def generate_text(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 async def list_models() -> list[str]:
+    payload = await list_models_payload()
+    models = payload.get("models", [])
+    return [str(model).strip() for model in models if str(model).strip()]
+
+
+def _normalize_model_folders(raw_folders: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw_folders, dict):
+        return {}
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for raw_name, raw_config in raw_folders.items():
+        folder_name = str(raw_name).strip()
+        if not folder_name or not isinstance(raw_config, dict):
+            continue
+
+        raw_models = raw_config.get("models", [])
+        models = [str(model).strip() for model in raw_models if str(model).strip()] if isinstance(raw_models, list) else []
+        default_model_raw = raw_config.get("default_model")
+        default_model = (
+            str(default_model_raw).strip() if isinstance(default_model_raw, str) and default_model_raw.strip() else None
+        )
+
+        normalized[folder_name] = {
+            "models": models,
+            "default_model": default_model,
+        }
+
+    return normalized
+
+
+async def list_models_payload() -> dict[str, Any]:
     timeout = httpx.Timeout(timeout=settings.llm_service_timeout_seconds)
 
     try:
@@ -89,4 +120,7 @@ async def list_models() -> list[str]:
     if not isinstance(models, list):
         raise LLMClientError("LLM models response is missing a valid models list.")
 
-    return [str(model).strip() for model in models if str(model).strip()]
+    return {
+        "models": [str(model).strip() for model in models if str(model).strip()],
+        "folders": _normalize_model_folders(payload.get("folders", {})),
+    }
