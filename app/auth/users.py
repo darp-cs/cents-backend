@@ -6,7 +6,7 @@ import bcrypt
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,15 +25,36 @@ user_router = APIRouter()
 
 class UserRead(BaseModel):
     id: uuid.UUID
+    username: str
     email: EmailStr
+    first_name: str
+    last_name: str
     is_active: bool
     is_superuser: bool
     is_verified: bool
 
 
 class UserRegister(BaseModel):
+    username: str = Field(min_length=3, max_length=150)
+    first_name: str = Field(min_length=1, max_length=100)
+    last_name: str = Field(min_length=1, max_length=100)
     email: EmailStr
     password: str
+
+    @field_validator("username", "first_name", "last_name")
+    @classmethod
+    def trim_non_empty(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("This field cannot be empty")
+        return trimmed
+
+    @field_validator("username")
+    @classmethod
+    def username_no_spaces(cls, value: str) -> str:
+        if any(char.isspace() for char in value):
+            raise ValueError("Username cannot contain spaces")
+        return value
 
 
 class TokenResponse(BaseModel):
@@ -75,6 +96,11 @@ async def _get_user_by_email(session: AsyncSession, email: str) -> User | None:
     return result.scalar_one_or_none()
 
 
+async def _get_user_by_username(session: AsyncSession, username: str) -> User | None:
+    result = await session.execute(select(User).where(User.username == username))
+    return result.scalar_one_or_none()
+
+
 async def current_active_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     session: AsyncSession = Depends(get_async_session),
@@ -94,9 +120,9 @@ async def login(
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
     session: AsyncSession = Depends(get_async_session),
 ):
-    user = await _get_user_by_email(session, form_data.username)
+    user = await _get_user_by_username(session, form_data.username.strip())
     if user is None or not _verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid email or password")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid username or password")
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User is inactive")
 
@@ -117,8 +143,15 @@ async def register(payload: UserRegister, session: AsyncSession = Depends(get_as
     if existing_user is not None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email is already registered")
 
+    existing_username = await _get_user_by_username(session, payload.username)
+    if existing_username is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username is already taken")
+
     user = User(
+        username=payload.username,
         email=str(payload.email),
+        first_name=payload.first_name,
+        last_name=payload.last_name,
         hashed_password=_hash_password(payload.password),
         is_active=True,
         is_superuser=False,
