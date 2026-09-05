@@ -1,5 +1,6 @@
 from app.config import settings
 from app.graph.state import GraphState
+from app.vector_store import query_tools
 
 
 def tool_retrieval_node(state: GraphState) -> GraphState:
@@ -9,19 +10,17 @@ def tool_retrieval_node(state: GraphState) -> GraphState:
             query_text = str(message.get("content", ""))
             break
 
-    # TODO: model config -> generate a tool embedding from query_text, output vector of length VECTOR_DIMENSION.
+    # TODO: model config -> generate a tool embedding from query_text.
     query_embedding = [0.0 for _ in range(settings.vector_dimension)]
-
-    # Example pgvector query shape for a tool table with an embedding column:
-    # SELECT name, description, 1 - (embedding <=> :query_embedding) AS similarity
-    # FROM tool_definitions ORDER BY embedding <=> :query_embedding LIMIT 5;
+    tools = query_tools(query_embedding=query_embedding, limit=5)
     state["retrieved_tools"] = [
         {
-            "name": "tool_search",
-            "description": "Generic tool lookup for user intent and operation selection.",
-            "similarity": 0.9,
-            "source": "placeholder",
+            "name": item["name"],
+            "description": item["description"],
+            "similarity": item["similarity"],
+            "source": item["source"],
             "query": query_text,
         }
+        for item in tools
     ]
     return state

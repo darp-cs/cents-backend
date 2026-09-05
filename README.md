@@ -1,15 +1,19 @@
 # Cents Backend
 
-Cents is a multi-user RAG chatbot backend built with Python 3.12, FastAPI, LangGraph, and PostgreSQL with pgvector. The service is designed for authenticated users, conversation-scoped chat sessions, document ingestion for retrieval-augmented generation, and tool registration/retrieval for extensible agent workflows.
+Cents is a multi-user RAG chatbot backend built with Python 3.12, FastAPI, LangGraph, SQLite, and ChromaDB.
 
-This backend is intentionally structured so the core application, database, auth, and graph orchestration are separated cleanly. It is ready for a future model layer to be plugged in without rewriting the service boundaries.
+This repository now uses a single backend stack:
+- relational/auth/conversation data in SQLite
+- vector storage and similarity search in ChromaDB
+
+PostgreSQL, pgvector, Alembic, Docker Compose, and WSL are not required for normal development.
 
 ## High-level architecture
 
 ```mermaid
 flowchart LR
-    A[Angular frontend] -->|HTTPS + JWT| B[FastAPI API]
-    B --> C[Auth layer\nfastapi-users + JWT]
+    A[Frontend] -->|HTTPS + JWT| B[FastAPI API]
+    B --> C[Auth layer\nJWT + bcrypt]
     B --> D[Conversations API]
     B --> E[Chat API]
     B --> F[Documents API]
@@ -20,76 +24,76 @@ flowchart LR
     H --> J[Document retrieval node]
     H --> K[Generation node]
     K --> L[Judge node]
-    L -->|pass| M[Response to frontend]
+    L -->|pass| M[Response]
     L -->|retry| H
 
-    I --> N[PostgreSQL + pgvector\ntool_definitions]
-    J --> O[PostgreSQL + pgvector\ndocuments]
-    D --> P[PostgreSQL\nconversations]
-    C --> Q[PostgreSQL\nusers]
-    F --> O
-    G --> N
+    C --> N[SQLite\nusers]
+    D --> O[SQLite\nconversations]
+    F --> P[SQLite\ndocuments metadata]
+    G --> Q[SQLite\ntool definitions]
+
+    I --> R[ChromaDB\ntool vectors]
+    J --> S[ChromaDB\ndocument vectors]
 ```
 
 ## What this project includes
 
-- FastAPI app with CORS enabled for the Angular dev origin
-- JWT authentication via fastapi-users using PostgreSQL as the backing database
-- Conversation CRUD endpoints scoped per user
-- Chat endpoint that streams response updates over SSE
-- Document upload and chunk storage with pgvector embeddings
-- Tool definition registration and retrieval with pgvector search
-- LangGraph orchestration for route selection, retrieval, generation, and retry/judge flow
-- Async Postgres checkpoint persistence for graph state
-- Alembic migration support for schema evolution
-
-## Core backend flow
-
-1. A user signs in with email/password and receives a JWT token.
-2. The frontend calls the authenticated routes under /conversations, /chat, /documents, and /tools.
-3. The chat flow routes through LangGraph:
-   - orchestrator decides whether to retrieve tools, docs, both, or generate directly
-   - retrieval nodes query pgvector tables
-   - generation node assembles prompt + context
-   - judge node determines whether the answer is acceptable or should retry
-4. State is persisted through the Postgres-backed checkpoint saver.
-5. User-owned data is filtered by the authenticated user id to keep multi-user access isolated.
+- FastAPI backend with CORS support
+- JWT auth via local auth routes and bcrypt password hashing
+- Conversation CRUD (user-scoped)
+- SSE chat endpoint backed by LangGraph orchestration
+- Document ingestion into SQLite + Chroma
+- Tool registration into SQLite + Chroma
 
 ## Project structure
 
 ```text
 app/
 ├── auth/
-│   └── users.py                 # fastapi-users setup, JWT auth, user manager
+│   └── users.py
 ├── db/
-│   ├── base.py                  # SQLAlchemy async engine/session
-│   ├── models.py                # User, Conversation, Document, ToolDefinition
-│   └── migrations/
-│       ├── env.py               # Alembic environment config
-│       ├── versions/
-│       └── ...
+│   ├── base.py
+│   └── models.py
 ├── graph/
-│   ├── state.py                 # graph state schema
-│   ├── orchestrator.py           # route selection logic
-│   ├── retrieval_tools.py        # tool retrieval node
-│   ├── retrieval_docs.py         # document retrieval node
-│   ├── generation.py             # generation node shell
-│   ├── judge.py                 # judge node shell
-│   ├── graph.py                 # StateGraph orchestration graph
-│   └── checkpointer.py          # AsyncPostgresSaver setup
+│   ├── state.py
+│   ├── orchestrator.py
+│   ├── retrieval_tools.py
+│   ├── retrieval_docs.py
+│   ├── generation.py
+│   ├── judge.py
+│   ├── graph.py
+│   └── checkpointer.py
 ├── routes/
-│   ├── conversations.py         # conversation CRUD
-│   ├── chat.py                  # SSE chat endpoint
-│   ├── documents.py             # document upload and listing
-│   └── tools.py                 # tool registration/listing
-├── config.py                    # env-driven settings
-├── main.py                      # FastAPI app registration
-└── __init__.py
+│   ├── conversations.py
+│   ├── chat.py
+│   ├── documents.py
+│   └── tools.py
+├── vector_store.py
+├── config.py
+└── main.py
 ```
 
-## Quick start
+## Python version
 
-The project includes setup scripts for both macOS/Linux and Windows so you can get the app running with minimal manual work.
+Python 3.12 is required.
+
+## Setup
+
+### Windows (native)
+
+From the repository root:
+
+```powershell
+scripts\setup.bat
+scripts\start.bat
+```
+
+Alternative PowerShell scripts:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start.ps1
+```
 
 ### macOS / Linux
 
@@ -99,93 +103,142 @@ chmod +x scripts/setup.sh scripts/start.sh
 ./scripts/start.sh
 ```
 
-### Windows (cmd)
+## Manual setup (all platforms)
 
-```cmd
-scripts\setup.bat
+On macOS/Linux:
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -c "import asyncio; from app.db.base import init_db; from app.vector_store import ensure_vector_store_ready; asyncio.run(init_db()); ensure_vector_store_ready()"
+.venv/bin/python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+On Windows native, use `.venv\Scripts\python.exe` instead of `.venv/bin/python`.
+
+## Start commands
+
+Windows (CMD):
+
+```bat
 scripts\start.bat
 ```
 
-### Manual setup
+Windows (PowerShell):
 
-If you want to do it step by step instead of using the scripts:
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start.ps1
+```
+
+macOS / Linux:
 
 ```bash
-cp .env.example .env
-python3 -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-docker compose up -d
-python -m alembic upgrade head
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+./scripts/start.sh
 ```
 
-## Environment setup
+## Environment
 
-Copy the sample environment file and adjust values:
+This project uses one environment file: `.env`.
 
-```bash
-cp .env.example .env
+Important variables:
+- DATABASE_URL
+- JWT_SECRET
+- CORS_ORIGINS
+- VECTOR_DIMENSION
+- CHROMA_PERSIST_DIRECTORY
+- CHROMA_DOCUMENTS_COLLECTION
+- CHROMA_TOOLS_COLLECTION
+- LLM_SERVICE_BASE_URL
+- LLM_SERVICE_GENERATE_PATH
+- LLM_SERVICE_MODELS_PATH
+- LLM_SERVICE_API_KEY
+- LLM_SERVICE_TIMEOUT_SECONDS
+- LLM_DEFAULT_GENERATION_MODEL_TYPE
+- LLM_DEFAULT_GENERATION_MODEL
+- LLM_DEFAULT_JUDGE_MODEL_TYPE
+- LLM_DEFAULT_JUDGE_MODEL
+- LLM_JUDGE_ENABLED
+- LLM_DEFAULT_TEMPERATURE
+- LLM_DEFAULT_MAX_TOKENS
+
+Default local values already target SQLite + Chroma.
+
+## LLM Service Dependency
+
+`cents-backend` now delegates generation calls to the sibling `cents-llm` service.
+
+Recommended local run order:
+
+1. Start Ollama and pull a starter model (for example `qwen2.5:3b-instruct`).
+2. Start `cents-llm` on `http://127.0.0.1:8100`.
+3. Start `cents-backend`.
+
+If `LLM_SERVICE_API_KEY` is configured in `cents-llm`, set the same value in backend `.env`.
+
+## Multi-model Routing
+
+The backend can use different models per conversation and per graph node.
+
+### Get available models
+
+- `GET /chat/models`
+- Requires auth
+- Returns model list from `cents-llm` plus backend defaults and supported node keys.
+
+### Set conversation model config
+
+- `GET /conversations/{conversation_id}/model-config`
+- `PUT /conversations/{conversation_id}/model-config`
+
+Payload shape for `PUT`:
+
+```json
+{
+    "node_llm_configs": {
+        "generation": {
+            "model_type": "text-generation",
+            "model": "qwen2.5:3b-instruct"
+        },
+        "judge": {
+            "model_type": "reasoning"
+        }
+    }
+}
 ```
 
-Required environment variables:
+### Per-request model override
 
-- `DATABASE_URL`
-- `JWT_SECRET`
-- `CORS_ORIGINS`
-- `VECTOR_DIMENSION`
-- `APP_NAME`
+`POST /chat` accepts optional fields:
 
-## Run the backend
+- `node_llm_configs`: per-node map where each entry includes required `model_type` and optional `model`
 
-### 1) Start Postgres with pgvector
+Request body example:
 
-```bash
-docker compose up -d
+```json
+{
+    "conversation_id": "...",
+    "message": "Summarize the latest updates",
+    "node_llm_configs": {
+        "generation": {
+            "model_type": "text-generation"
+        },
+        "judge": {
+            "model_type": "reasoning",
+            "model": "llama3.2:3b-instruct"
+        }
+    }
+}
 ```
 
-### 2) Apply database migrations
+Rules:
 
-```bash
-alembic upgrade head
-```
+- For every node that triggers an LLM call, `model_type` is required.
+- `model` is optional per node. If omitted, `cents-llm` resolves the default model for that `model_type` folder.
 
-### 3) Start the API
+## Notes
 
-```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-### On Windows cmd
-
-```cmd
-.venv\Scripts\activate.bat
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-### On macOS/Linux
-
-```bash
-source .venv/bin/activate
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-## Notes for developers
-
-- The project intentionally leaves real model calls and embeddings as `# TODO: model config` placeholders so they can be connected later without disturbing the API or graph structure.
-- All user-owned resources are scoped to the authenticated user id.
-- The chat route includes a TODO note for rate limiting/concurrency because a single local model worker will naturally serialize requests.
-- The PostgreSQL instance is the system of record for users, conversations, documents, and tool metadata.
-
-## Future extension points
-
-- Add the LLM provider and embedding model implementation in the TODO locations.
-- Add model-specific prompt templates and retry logic.
-- Add document chunking strategies and indexing background jobs.
-- Add more tool definitions and execution handlers.
-- Add tests for auth, conversation ownership, RAG queries, and SSE streaming.
-
----
-
-This project is intentionally organized as a clean backend scaffold for a multi-user, document-aware, tool-augmented chatbot.
+- Current vector embeddings are placeholders (zero vectors) until model integration is added.
+- SQLite stores the relational records; Chroma stores the vectors and similarity index.
+- On startup, if the local SQLite database file does not exist, it is created automatically.
+- Local runtime artifacts such as `cents.db`, `.chroma/`, and `*.log` are git-ignored.
