@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 NODE_ID_PATTERN = r"^[A-Za-z][A-Za-z0-9_-]*$"
 TEMPLATE_VERSION_PATTERN = r"^\d+\.\d+(\.\d+)?$"
@@ -89,6 +89,13 @@ class ConditionNode(_BaseNode):
     type: Literal["condition"]
     config: ConditionConfig
     branches: dict[str, str] = Field(min_length=1)
+
+    @field_validator("branches")
+    @classmethod
+    def ensure_default_branch(cls, value: dict[str, str]) -> dict[str, str]:
+        if "default" not in value:
+            raise ValueError("Condition nodes must define a 'default' branch.")
+        return value
 
 
 class ServiceCallNode(_BaseNode):
