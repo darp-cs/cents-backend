@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.compiler import get_compiled_agent_graph, invalidate_compiled_agent_graph
 from app.agents.template_schema import validate_template
 from app.auth.users import current_active_user
 from app.db.base import get_async_session
@@ -153,6 +154,11 @@ async def _create_version(
     session.add(record)
     await session.commit()
     await session.refresh(record)
+
+    if result.template is not None:
+        # Warm cache so this version does not need recompilation at first execution.
+        get_compiled_agent_graph(name=name, version=next_version, template=result.template)
+
     return record
 
 
@@ -300,4 +306,5 @@ async def delete_agent(
 
     await session.execute(delete(AgentTemplate).where(AgentTemplate.name == normalized_name))
     await session.commit()
+    invalidate_compiled_agent_graph(normalized_name)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
