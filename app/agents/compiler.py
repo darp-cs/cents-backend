@@ -82,6 +82,17 @@ def compile_agent_graph(template: AgentTemplate) -> CompiledStateGraph:
             )
             continue
 
+        if isinstance(node, LLMStepNode) and node.on_failure:
+            workflow.add_conditional_edges(
+                node.id,
+                _build_llm_step_router(node.id),
+                {
+                    "success": node.next,
+                    "failure": node.on_failure,
+                },
+            )
+            continue
+
         if isinstance(node, TerminalResponseNode):
             workflow.add_edge(node.id, END)
             continue
@@ -167,6 +178,13 @@ def _build_service_call_router(node_id: str) -> Callable[[SubAgentState], str]:
     return _router
 
 
+def _build_llm_step_router(node_id: str) -> Callable[[SubAgentState], str]:
+    def _router(state: SubAgentState) -> str:
+        return _resolve_llm_step_route(node_id, state)
+
+    return _router
+
+
 def _resolve_condition_route(node: ConditionNode, state: SubAgentState) -> str:
     parsed_data = state.get("parsed_data", {})
     if isinstance(parsed_data, dict):
@@ -193,6 +211,15 @@ def _resolve_service_call_route(node_id: str, state: SubAgentState) -> str:
     if isinstance(service_results, dict):
         node_result = service_results.get(node_id)
         if isinstance(node_result, dict) and node_result.get("__status__") == "failure":
+            return "failure"
+    return "success"
+
+
+def _resolve_llm_step_route(node_id: str, state: SubAgentState) -> str:
+    parsed_data = state.get("parsed_data", {})
+    if isinstance(parsed_data, dict):
+        llm_step_status = parsed_data.get("__llm_step_status__", {})
+        if isinstance(llm_step_status, dict) and llm_step_status.get(node_id) == "failure":
             return "failure"
     return "success"
 
@@ -1034,15 +1061,128 @@ def _execute_user_interrupt(node: AgentNode, state: SubAgentState) -> SubAgentSt
 def _execute_llm_step(node: AgentNode, state: SubAgentState) -> SubAgentState:
     assert isinstance(node, LLMStepNode)
     next_state = _touch_iteration(state)
+
+    rendered_system_prompt = _render_llm_step_system_prompt(node.config.system_prompt, next_state)
+    request_payload: dict[str, Any] = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Complete exactly the task described by the system prompt.",
+            }
+        ],
+        "system_prompt": rendered_system_prompt,
+        "model_folder": node.config.model_type,
+        "temperature": node.config.temperature,
+        "max_tokens": node.config.max_tokens,
+        "metadata": {
+            "node": node.id,
+            "component": "llm_step",
+        },
+    }
+    if node.config.model:
+        request_payload["model"] = node.config.model
+
+    try:
+        payload = _run_async(generate_text(request_payload))
+    except LLMClientError as exc:
+        return _handle_llm_step_failure(node=node, state=next_state, message=str(exc))
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("LLM step returned an invalid payload.")
+
+    generated_text = str(payload.get("text", "")).strip()
+    if not generated_text:
+        raise RuntimeError("LLM step returned empty text.")
+
     messages = list(next_state.get("messages", []))
     messages.append(
         {
             "role": "assistant",
-            "content": f"[stub:{node.id}] {node.config.prompt_template}",
+            "content": generated_text,
         }
     )
     next_state["messages"] = messages
+
+    parsed_data = dict(next_state.get("parsed_data", {}))
+    if node.config.output_key:
+        parsed_data[node.config.output_key] = generated_text
+    _set_llm_step_status(parsed_data, node.id, "success")
+    next_state["parsed_data"] = parsed_data
+
     return next_state
+
+
+def _handle_llm_step_failure(
+    node: LLMStepNode,
+    state: SubAgentState,
+    message: str,
+) -> SubAgentState:
+    if node.on_failure is None:
+        raise RuntimeError(f"LLM step node '{node.id}' failed: {message}")
+
+    parsed_data = dict(state.get("parsed_data", {}))
+    llm_step_errors = parsed_data.get("__llm_step_errors__", {})
+    if not isinstance(llm_step_errors, dict):
+        llm_step_errors = {}
+    llm_step_errors[node.id] = message
+    parsed_data["__llm_step_errors__"] = llm_step_errors
+    _set_llm_step_status(parsed_data, node.id, "failure")
+
+    next_state = cast(SubAgentState, dict(state))
+    next_state["parsed_data"] = parsed_data
+    return next_state
+
+
+def _set_llm_step_status(parsed_data: dict[str, Any], node_id: str, status: str) -> None:
+    llm_step_status = parsed_data.get("__llm_step_status__", {})
+    if not isinstance(llm_step_status, dict):
+        llm_step_status = {}
+    llm_step_status[node_id] = status
+    parsed_data["__llm_step_status__"] = llm_step_status
+
+
+def _render_llm_step_system_prompt(template: str, state: SubAgentState) -> str:
+    pattern = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+    rendered = template
+    for match in pattern.finditer(template):
+        placeholder = match.group(0)
+        reference = match.group(1)
+        resolved = _resolve_llm_step_reference(reference, state)
+        rendered = rendered.replace(placeholder, str(resolved))
+    return rendered
+
+
+def _resolve_llm_step_reference(reference: str, state: SubAgentState) -> Any:
+    parsed_data = state.get("parsed_data", {})
+    service_results = state.get("service_results", {})
+    if not isinstance(parsed_data, dict):
+        raise RuntimeError("parsed_data must be an object for llm_step system_prompt rendering.")
+    if not isinstance(service_results, dict):
+        raise RuntimeError("service_results must be an object for llm_step system_prompt rendering.")
+
+    path = reference.strip()
+    if path.startswith("state."):
+        path = path[len("state.") :]
+
+    if not (
+        path == "parsed_data"
+        or path.startswith("parsed_data.")
+        or path == "service_results"
+        or path.startswith("service_results.")
+    ):
+        raise RuntimeError(
+            "llm_step system_prompt placeholders may only reference "
+            "parsed_data.* or service_results.*"
+        )
+
+    scoped_state = cast(
+        SubAgentState,
+        {
+            "parsed_data": parsed_data,
+            "service_results": service_results,
+        },
+    )
+    return _resolve_state_reference(scoped_state, path)
 
 
 def _execute_terminal_response(node: AgentNode, state: SubAgentState) -> SubAgentState:

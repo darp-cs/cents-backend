@@ -75,7 +75,10 @@ def valid_template() -> dict:
                 "id": "summarize",
                 "type": "llm_step",
                 "config": {
-                    "prompt_template": "Summarize {{ ledger_result }}",
+                    "model_type": "text-generation",
+                    "system_prompt": "Summarize this result: {{ service_results.call_ledger.body }}",
+                    "temperature": 0.2,
+                    "max_tokens": 128,
                     "output_key": "summary",
                 },
                 "next": "respond",
@@ -173,13 +176,25 @@ def test_missing_terminal_node_is_rejected() -> None:
             {
                 "id": "loop_a",
                 "type": "llm_step",
-                "config": {"prompt_template": "a", "output_key": "a"},
+                "config": {
+                    "model_type": "text-generation",
+                    "system_prompt": "a",
+                    "temperature": 0.2,
+                    "max_tokens": 32,
+                    "output_key": "a",
+                },
                 "next": "loop_b",
             },
             {
                 "id": "loop_b",
                 "type": "llm_step",
-                "config": {"prompt_template": "b", "output_key": "b"},
+                "config": {
+                    "model_type": "text-generation",
+                    "system_prompt": "b",
+                    "temperature": 0.2,
+                    "max_tokens": 32,
+                    "output_key": "b",
+                },
                 "next": "loop_a",
             },
         ],
@@ -225,13 +240,25 @@ def test_node_that_cannot_reach_terminal_is_rejected() -> None:
             {
                 "id": "dead_end_a",
                 "type": "llm_step",
-                "config": {"prompt_template": "a", "output_key": "a"},
+                "config": {
+                    "model_type": "text-generation",
+                    "system_prompt": "a",
+                    "temperature": 0.2,
+                    "max_tokens": 32,
+                    "output_key": "a",
+                },
                 "next": "dead_end_b",
             },
             {
                 "id": "dead_end_b",
                 "type": "llm_step",
-                "config": {"prompt_template": "b", "output_key": "b"},
+                "config": {
+                    "model_type": "text-generation",
+                    "system_prompt": "b",
+                    "temperature": 0.2,
+                    "max_tokens": 32,
+                    "output_key": "b",
+                },
                 "next": "dead_end_a",
             },
             {
@@ -330,3 +357,17 @@ def test_service_call_tool_requires_name_or_id(valid_template: dict) -> None:
 
     assert not result.is_valid
     assert any("mode='tool' requires tool_name or tool_id" in error for error in result.errors)
+
+
+def test_llm_step_system_prompt_rejects_unscoped_placeholders(valid_template: dict) -> None:
+    template = copy.deepcopy(valid_template)
+    template["nodes"][4]["config"]["system_prompt"] = "Use {{ input }} and {{ parsed_data.amount }}"
+
+    result = validate_template(template)
+
+    assert not result.is_valid
+    assert any(
+        "llm_step system_prompt placeholders must reference parsed_data.* or service_results.*"
+        in error
+        for error in result.errors
+    )

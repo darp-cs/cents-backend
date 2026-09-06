@@ -152,6 +152,10 @@ Use `validate_template(raw_json)` to parse and validate templates. It checks:
 - `service_call` supports:
     - `mode=http`: configured `url` + `method`, with header/body template interpolation from state
     - `mode=tool`: reference to a registered `ToolDefinition` by `tool_name` or `tool_id`
+- `llm_step` supports a single scoped LLM call with explicit `model_type`, `temperature`, `max_tokens`, and templated `system_prompt`.
+- `llm_step` `system_prompt` placeholders are limited to `parsed_data.*` and `service_results.*` to prevent implicit full-state prompt injection.
+- `llm_step` writes generated text to `messages` and can optionally persist to `parsed_data[output_key]`.
+- `llm_step` LLM client failures route to `on_failure` when configured, otherwise they raise a runtime error.
 - HTTP service calls are SSRF-protected via `SERVICE_CALL_ALLOWED_HOSTS` unless unsafe destinations are explicitly enabled server-side.
 - Sensitive headers/body fields must reference server-side secrets using placeholders (for example `{{ secret.my_api_key }}`), never hardcoded values in templates.
 - Service call responses are stored at `service_results[node_id]`.
