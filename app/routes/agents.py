@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Annotated, Any
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,6 +45,25 @@ class AgentTemplateEnabledPatchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool
+    version: int | None = Field(default=None, ge=1)
+
+
+class AgentRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input: str = Field(min_length=1)
+    version: int | None = Field(default=None, ge=1)
+    thread_id: str | None = Field(default=None, min_length=1)
+    parsed_data: dict[str, Any] = Field(default_factory=dict)
+    service_results: dict[str, Any] = Field(default_factory=dict)
+    node_llm_configs: dict[str, dict[str, str | None]] = Field(default_factory=dict)
+
+
+class AgentResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answer: Any
+    thread_id: str = Field(min_length=1)
     version: int | None = Field(default=None, ge=1)
 
 
@@ -116,6 +138,67 @@ async def _get_versions_for_name(session: AsyncSession, name: str) -> list[Agent
         .order_by(AgentTemplate.version.desc())
     )
     return list(result.scalars().all())
+
+
+def _extract_first_interrupt_payload(compiled_graph, config: dict[str, Any]) -> dict[str, Any] | None:
+    snapshot = compiled_graph.get_state(config)
+    for task in getattr(snapshot, "tasks", ()):
+        interrupts = getattr(task, "interrupts", ())
+        if not interrupts:
+            continue
+        raw_value = interrupts[0].value
+        return raw_value if isinstance(raw_value, dict) else {"value": raw_value}
+    return None
+
+
+async def _resolve_runnable_template(
+    session: AsyncSession,
+    *,
+    name: str,
+    requested_version: int | None,
+) -> tuple[AgentTemplate, dict[str, Any]]:
+    records = await _get_versions_for_name(session, name)
+    if not records:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent template not found")
+
+    if requested_version is None:
+        record = next((item for item in records if item.enabled), None)
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No enabled version is available for this agent.",
+            )
+    else:
+        record = next((item for item in records if item.version == requested_version), None)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent template not found")
+        if not record.enabled:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Requested version is disabled.",
+            )
+
+    if not record.is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot run an invalid template version.",
+        )
+
+    raw_template = _parse_json(record.raw_template)
+    if not isinstance(raw_template, dict):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Stored template payload is invalid.",
+        )
+
+    parsed = validate_template(raw_template)
+    if parsed.template is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Stored template failed validation.",
+        )
+
+    return record, raw_template
 
 
 async def _create_version(
@@ -240,6 +323,117 @@ async def get_latest_agent(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent template not found")
 
     return _serialize_record(latest)
+
+
+@router.post("/{name}/run", response_model=dict)
+async def run_agent(
+    name: str,
+    payload: AgentRunRequest,
+    user: Annotated[User, Depends(current_active_user)],
+    session: AsyncSession = Depends(get_async_session),
+):
+    normalized_name = name.strip()
+    record, raw_template = await _resolve_runnable_template(
+        session,
+        name=normalized_name,
+        requested_version=payload.version,
+    )
+    parsed = validate_template(raw_template)
+    if parsed.template is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Stored template failed validation.",
+        )
+
+    thread_id = payload.thread_id.strip() if payload.thread_id else (
+        f"user:{user.id}:agent:{normalized_name}:{uuid.uuid4()}"
+    )
+
+    state = {
+        "input": payload.input,
+        "parsed_data": dict(payload.parsed_data),
+        "messages": [{"role": "user", "content": payload.input}],
+        "iteration_count": 0,
+        "service_results": dict(payload.service_results),
+        "interrupt_payload": None,
+        "final_response": "",
+        "node_llm_configs": dict(payload.node_llm_configs),
+    }
+    config = {"configurable": {"thread_id": thread_id}}
+
+    compiled_graph = get_compiled_agent_graph(
+        name=normalized_name,
+        version=record.version,
+        template=parsed.template,
+    )
+
+    result = await asyncio.to_thread(compiled_graph.invoke, state, config)
+    interrupt_payload = _extract_first_interrupt_payload(compiled_graph, config)
+    if interrupt_payload is not None:
+        return {
+            "status": "interrupted",
+            "thread_id": thread_id,
+            "version": record.version,
+            "interrupt": interrupt_payload,
+            "state": result,
+        }
+
+    return {
+        "status": "completed",
+        "thread_id": thread_id,
+        "version": record.version,
+        "state": result,
+        "final_response": str(result.get("final_response", "")),
+    }
+
+
+@router.post("/{name}/resume", response_model=dict)
+async def resume_agent(
+    name: str,
+    payload: AgentResumeRequest,
+    user: Annotated[User, Depends(current_active_user)],
+    session: AsyncSession = Depends(get_async_session),
+):
+    del user
+
+    normalized_name = name.strip()
+    record, raw_template = await _resolve_runnable_template(
+        session,
+        name=normalized_name,
+        requested_version=payload.version,
+    )
+    parsed = validate_template(raw_template)
+    if parsed.template is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Stored template failed validation.",
+        )
+
+    config = {"configurable": {"thread_id": payload.thread_id.strip()}}
+    compiled_graph = get_compiled_agent_graph(
+        name=normalized_name,
+        version=record.version,
+        template=parsed.template,
+    )
+
+    result = await asyncio.to_thread(compiled_graph.invoke, Command(resume=payload.answer), config)
+    interrupt_payload = _extract_first_interrupt_payload(compiled_graph, config)
+    if interrupt_payload is not None:
+        return {
+            "status": "interrupted",
+            "thread_id": payload.thread_id.strip(),
+            "version": record.version,
+            "interrupt": interrupt_payload,
+            "state": result,
+        }
+
+    return {
+        "status": "completed",
+        "thread_id": payload.thread_id.strip(),
+        "version": record.version,
+        "state": result,
+        "final_response": str(result.get("final_response", "")),
+    }
 
 
 @router.put("/{name}", response_model=dict)
