@@ -67,6 +67,7 @@ app/
 │   ├── graph.py
 │   └── checkpointer.py
 ├── routes/
+│   ├── agents.py
 │   ├── conversations.py
 │   ├── chat.py
 │   ├── documents.py
@@ -170,6 +171,34 @@ Run them with:
 ```powershell
 .\.venv\Scripts\python.exe -m pytest tests/test_agent_template_schema.py -q
 ```
+
+## Agent templates API
+
+The backend exposes versioned template management for sub-agent workflows.
+
+Endpoints:
+
+- POST /agents
+    - Creates version 1 for a new template name.
+    - Runs template validation and stores `is_valid` plus `validation_errors`.
+- GET /agents
+    - Returns the latest version for each template name.
+- GET /agents/{name}
+    - Returns latest version details for a single template name.
+- GET /agents/{name}/versions
+    - Returns full version history for a template name.
+- PUT /agents/{name}
+    - Creates a new version instead of mutating existing history.
+- PATCH /agents/{name}/enabled
+    - Enables or disables a template version.
+    - Rejects enable=true for invalid templates with HTTP 400.
+    - Enforces one-active-version policy per agent name:
+        - enabling one version disables all others for that name
+        - disabling the last active version is rejected with HTTP 400
+- DELETE /agents/{name}
+    - Deletes all versions for that template name.
+
+All endpoints require an authenticated active user.
 
 ## Python version
 
