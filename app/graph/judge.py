@@ -91,6 +91,9 @@ async def _llm_judge_verdict(state: GraphState) -> tuple[str, str]:
 
 
 async def judge_node(state: GraphState) -> GraphState:
+    import time
+
+    started = time.perf_counter()
     generated_response = state.get("generated_response", "")
     retry_count = state.get("retry_count", 0)
 
@@ -105,4 +108,14 @@ async def judge_node(state: GraphState) -> GraphState:
 
     state["judge_verdict"] = {"verdict": verdict, "reason": reason}
     state["retry_count"] = retry_count + 1 if verdict == "fail" else retry_count
+    node_metrics = list(state.get("node_metrics", []))
+    node_metrics.append(
+        {
+            "node_key": "judge",
+            "latency_ms": (time.perf_counter() - started) * 1000,
+            "tokens_used": 0,
+            "status": "completed",
+        }
+    )
+    state["node_metrics"] = node_metrics
     return state

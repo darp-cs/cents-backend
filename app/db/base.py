@@ -73,8 +73,44 @@ def _ensure_users_columns(sync_connection) -> None:
         sync_connection.exec_driver_sql("CREATE UNIQUE INDEX ix_users_username ON users (username)")
 
 
+def _ensure_metrics_columns(sync_connection) -> None:
+    inspector = inspect(sync_connection)
+    migrations = {
+        "metric_requests": {
+            "completed_at": "DATETIME",
+            "latency_ms": "FLOAT",
+            "total_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "judge_verdict": "VARCHAR(16)",
+            "status": "VARCHAR(32) NOT NULL DEFAULT 'started'",
+            "error": "TEXT",
+            "retrieved_tools_json": "TEXT NOT NULL DEFAULT '[]'",
+            "retrieved_documents_json": "TEXT NOT NULL DEFAULT '[]'",
+        },
+        "metric_events": {
+            "request_id": "CHAR(32)",
+            "started_at": "DATETIME",
+            "completed_at": "DATETIME",
+            "latency_ms": "FLOAT",
+            "tokens_used": "INTEGER NOT NULL DEFAULT 0",
+            "status": "VARCHAR(32) NOT NULL DEFAULT 'completed'",
+            "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    }
+
+    for table_name, columns in migrations.items():
+        if table_name not in inspector.get_table_names():
+            continue
+        existing_columns = {column["name"] for column in inspector.get_columns(table_name)}
+        for column_name, definition in columns.items():
+            if column_name not in existing_columns:
+                sync_connection.exec_driver_sql(
+                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
+                )
+
+
 async def init_db():
     _ensure_sqlite_database_path()
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
         await connection.run_sync(_ensure_users_columns)
+        await connection.run_sync(_ensure_metrics_columns)

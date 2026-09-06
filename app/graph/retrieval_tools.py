@@ -4,6 +4,9 @@ from app.vector_store import query_tools
 
 
 def tool_retrieval_node(state: GraphState) -> GraphState:
+    import time
+
+    started = time.perf_counter()
     query_text = ""
     for message in state.get("messages", []):
         if message.get("role") == "user":
@@ -23,4 +26,7 @@ def tool_retrieval_node(state: GraphState) -> GraphState:
         }
         for item in tools
     ]
+    node_metrics = list(state.get("node_metrics", []))
+    node_metrics.append({"node_key": "tool_retrieval", "latency_ms": (time.perf_counter() - started) * 1000, "tokens_used": 0, "status": "completed"})
+    state["node_metrics"] = node_metrics
     return state

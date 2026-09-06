@@ -17,3 +17,5 @@ class GraphState(TypedDict, total=False):
     judge_verdict: dict[str, Any] | None
     next_route: str
     generated_response: str
+    token_usage: dict[str, int]
+    node_metrics: list[dict[str, Any]]

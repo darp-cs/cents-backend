@@ -3,6 +3,21 @@ from app.graph.state import GraphState
 from app.llm.client import LLMClientError, generate_text
 
 
+def _extract_token_count(payload: dict) -> int:
+    usage = payload.get("usage", payload.get("token_usage", {}))
+    if not isinstance(usage, dict):
+        return 0
+    for key in ("total_tokens", "tokens", "total"):
+        value = usage.get(key)
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+    input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
+    if isinstance(input_tokens, (int, float)) and isinstance(output_tokens, (int, float)):
+        return max(0, int(input_tokens) + int(output_tokens))
+    return 0
+
+
 def _build_context(retrieved_docs: list[dict], retrieved_tools: list[dict]) -> str:
     context_blocks = []
 
@@ -46,6 +61,9 @@ def _resolve_generation_model_config(state: GraphState) -> tuple[str, str | None
 
 
 async def generation_node(state: GraphState) -> GraphState:
+    import time
+
+    started = time.perf_counter()
     messages = list(state.get("messages", []))
     retrieved_docs = state.get("retrieved_docs", [])
     retrieved_tools = state.get("retrieved_tools", [])
@@ -90,4 +108,18 @@ async def generation_node(state: GraphState) -> GraphState:
 
     state["messages"] = messages
     state["generated_response"] = generated_text
+    tokens = _extract_token_count(payload)
+    token_usage = dict(state.get("token_usage", {}))
+    token_usage["generation"] = token_usage.get("generation", 0) + tokens
+    state["token_usage"] = token_usage
+    node_metrics = list(state.get("node_metrics", []))
+    node_metrics.append(
+        {
+            "node_key": "generation",
+            "latency_ms": (time.perf_counter() - started) * 1000,
+            "tokens_used": tokens,
+            "status": "completed",
+        }
+    )
+    state["node_metrics"] = node_metrics
     return state

@@ -10,6 +10,7 @@ from app.routes.chat import router as chat_router
 from app.routes.configuration import router as configuration_router
 from app.routes.conversations import router as conversations_router
 from app.routes.documents import router as documents_router
+from app.routes.metrics import router as metrics_router
 from app.routes.tools import router as tools_router
 from app.vector_store import ensure_vector_store_ready
 
@@ -46,3 +47,4 @@ app.include_router(configuration_router, prefix="/configuration", tags=["configu
 app.include_router(documents_router, prefix="/documents", tags=["documents"])
 app.include_router(tools_router, prefix="/tools", tags=["tools"])
 app.include_router(agents_router, prefix="/agents", tags=["agents"])
+app.include_router(metrics_router, prefix="/metrics", tags=["metrics"])

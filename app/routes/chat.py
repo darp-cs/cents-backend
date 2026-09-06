@@ -1,4 +1,6 @@
 import json
+from datetime import datetime, timezone
+import time
 from typing import Any
 from typing import Annotated
 
@@ -14,6 +16,7 @@ from app.db.models import User
 from app.graph.graph import get_graph
 from app.llm.client import LLMClientError, list_models_payload
 from app.services.conversation_models import get_conversation_for_user, get_conversation_model_config
+from app.services.metrics import create_metric_request, finalize_metric_request
 
 router = APIRouter()
 SUPPORTED_LLM_NODES = ("generation", "judge")
@@ -161,6 +164,9 @@ async def chat(
 
     _ensure_required_node_model_types(effective_node_llm_configs)
 
+    metric_started_at = datetime.now(timezone.utc)
+    metric_request = await create_metric_request(session, user.id, metric_started_at)
+
     state = {
         "messages": [{"role": "user", "content": payload.message}],
         "user_id": user_id,
@@ -169,9 +175,22 @@ async def chat(
         "retry_count": 0,
     }
 
+    metric_clock_started = time.perf_counter()
+
     async def event_stream():
         try:
             result = await graph.ainvoke(state)
+            try:
+                await finalize_metric_request(
+                    session,
+                    metric_request,
+                    completed_at=datetime.now(timezone.utc),
+                    latency_ms=(time.perf_counter() - metric_clock_started) * 1000,
+                    status="completed",
+                    result=result,
+                )
+            except Exception:
+                await session.rollback()
             generated_response = str(result.get("generated_response", "")).strip()
 
             if not generated_response:
@@ -182,6 +201,17 @@ async def chat(
             yield f"data: {json.dumps({'message': generated_response})}\n\n"
             yield f"data: {json.dumps({'done': True})}\n\n"
         except Exception as exc:
+            try:
+                await finalize_metric_request(
+                    session,
+                    metric_request,
+                    completed_at=datetime.now(timezone.utc),
+                    latency_ms=(time.perf_counter() - metric_clock_started) * 1000,
+                    status="failed",
+                    error=str(exc),
+                )
+            except Exception:
+                await session.rollback()
             yield f"data: {json.dumps({'error': str(exc), 'done': True})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
