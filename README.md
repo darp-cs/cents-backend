@@ -51,6 +51,8 @@ flowchart LR
 app/
 ├── agents/
 │   ├── __init__.py
+│   ├── compiler.py
+│   ├── state.py
 │   └── template_schema.py
 ├── auth/
 │   └── users.py
@@ -77,6 +79,7 @@ app/
 └── main.py
 
 tests/
+├── test_agent_compiler.py
 └── test_agent_template_schema.py
 ```
 
@@ -94,6 +97,7 @@ If you are new to the codebase, read in this order:
 ## Agent workflow templates (schema-first)
 
 The backend now includes formal workflow schema models in `app/agents/template_schema.py`.
+Validated templates are compiled into isolated executable graphs in `app/agents/compiler.py`.
 
 ### Why this exists
 
@@ -130,6 +134,14 @@ Use `validate_template(raw_json)` to parse and validate templates. It checks:
 4. No unreachable nodes (orphans) from `entry_node`.
 5. At least one `terminal_response` exists.
 6. Every node can reach a `terminal_response`.
+
+### Compilation behavior
+
+- `compile_agent_graph(template)` builds a standalone LangGraph `StateGraph` from the template.
+- Node execution is dispatched by node `type` through a compiler dispatch table.
+- `entry_node` is used as the graph entry point.
+- `next` and `branches` are translated into LangGraph edges.
+- Compiled graphs are cached per `(name, version)` for reuse.
 
 ### Minimal example
 
