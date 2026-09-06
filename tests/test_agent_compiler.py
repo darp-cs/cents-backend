@@ -107,6 +107,70 @@ def test_compile_agent_graph_executes_linear_flow(linear_template_dict: dict) ->
     assert result["iteration_count"] >= 3
 
 
+def test_terminal_response_interpolates_scoped_state_values() -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "call_service",
+        "nodes": [
+            {
+                "id": "call_service",
+                "type": "service_call",
+                "config": {
+                    "mode": "http",
+                    "url": "http://localhost/mock",
+                    "method": "POST",
+                    "body_template": {"amount": "{{ parsed_data.amount }}"},
+                },
+                "next": "respond",
+            },
+            {
+                "id": "respond",
+                "type": "terminal_response",
+                "config": {
+                    "template": (
+                        "amount={{ parsed_data.amount }}; "
+                        "first_message={{ messages.0.content }}; "
+                        "status={{ service_results.call_service.status_code }}"
+                    )
+                },
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    state = _base_state()
+    state["parsed_data"] = {"amount": 123}
+    state["messages"] = [{"role": "user", "content": "hello-world"}]
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(state)
+
+    assert result["final_response"] == "amount=123; first_message=hello-world; status=200"
+
+
+def test_terminal_response_supports_shorthand_for_parsed_data_keys() -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "respond",
+        "nodes": [
+            {
+                "id": "respond",
+                "type": "terminal_response",
+                "config": {"template": "{{ summary }}"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    state = _base_state()
+    state["parsed_data"] = {"summary": "Budget approved."}
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(state)
+
+    assert result["final_response"] == "Budget approved."
+
+
 def test_structured_parser_merges_new_fields_without_overwriting_existing_data(
     linear_template_dict: dict,
 ) -> None:
