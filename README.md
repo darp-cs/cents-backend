@@ -244,6 +244,43 @@ Endpoints:
 - DELETE /agents/{name}
     - Deletes all versions for that template name.
 
+### Sub-agent run streaming
+
+Long-running template execution now supports server-sent event (SSE) streaming.
+
+Endpoints:
+
+- POST /agents/{name}/runs
+    - Starts a new run and streams progress with `text/event-stream`.
+    - Generates user-scoped `run_id` and `thread_id` values using a `user_id:token` pattern.
+    - Uses the cached compiled graph for the selected template version.
+- POST /agents/runs/{run_id}/resume
+    - Resumes an interrupted run from checkpointed state with a user answer.
+    - Streams the same event format until the next interrupt or terminal completion.
+- GET /agents/runs/{run_id}
+    - Returns current run status and iteration count for polling/list views.
+
+SSE framing:
+
+- `data: {json}\n\n`
+
+Emitted events include:
+
+- `node_started` with `node_id`, `type`
+- `node_completed` with `node_id`, `duration`
+- `interrupt_requested` with `node_id`, `prompt`
+- `error` with `node_id`, `message`
+- `done` with either `final_response` (completed) or `awaiting_input: true` (paused)
+
+Run status values:
+
+- `running`
+- `awaiting_input`
+- `succeeded`
+- `failed`
+
+All run endpoints require an authenticated active user and are scoped to the requesting user.
+
 ## Platform configuration API
 
 The backend now exposes editable platform guardrails that can be updated without redeploying.
