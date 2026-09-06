@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from sqlalchemy import inspect
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
@@ -42,7 +43,38 @@ def _ensure_sqlite_database_path() -> None:
         db_path.touch()
 
 
+def _ensure_users_columns(sync_connection) -> None:
+    inspector = inspect(sync_connection)
+    if "users" not in inspector.get_table_names():
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("users")}
+
+    if "username" not in existing_columns:
+        sync_connection.exec_driver_sql("ALTER TABLE users ADD COLUMN username VARCHAR(150)")
+    if "first_name" not in existing_columns:
+        sync_connection.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN first_name VARCHAR(100) NOT NULL DEFAULT ''"
+        )
+    if "last_name" not in existing_columns:
+        sync_connection.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN last_name VARCHAR(100) NOT NULL DEFAULT ''"
+        )
+
+    sync_connection.exec_driver_sql(
+        "UPDATE users SET username = email WHERE username IS NULL OR trim(username) = ''"
+    )
+    sync_connection.exec_driver_sql("UPDATE users SET first_name = '' WHERE first_name IS NULL")
+    sync_connection.exec_driver_sql("UPDATE users SET last_name = '' WHERE last_name IS NULL")
+
+    refreshed_inspector = inspect(sync_connection)
+    existing_indexes = {index["name"] for index in refreshed_inspector.get_indexes("users")}
+    if "ix_users_username" not in existing_indexes:
+        sync_connection.exec_driver_sql("CREATE UNIQUE INDEX ix_users_username ON users (username)")
+
+
 async def init_db():
     _ensure_sqlite_database_path()
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        await connection.run_sync(_ensure_users_columns)

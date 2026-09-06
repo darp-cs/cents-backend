@@ -5,7 +5,9 @@ from app.auth.users import auth_router, register_router, user_router
 from app.config import settings
 from app.db.base import init_db
 from app.graph.graph import get_graph
+from app.routes.agents import router as agents_router
 from app.routes.chat import router as chat_router
+from app.routes.configuration import router as configuration_router
 from app.routes.conversations import router as conversations_router
 from app.routes.documents import router as documents_router
 from app.routes.tools import router as tools_router
@@ -40,5 +42,7 @@ app.include_router(register_router, prefix="/auth", tags=["auth"])
 app.include_router(user_router, prefix="/users", tags=["users"])
 app.include_router(conversations_router, prefix="/conversations", tags=["conversations"])
 app.include_router(chat_router, prefix="/chat", tags=["chat"])
+app.include_router(configuration_router, prefix="/configuration", tags=["configuration"])
 app.include_router(documents_router, prefix="/documents", tags=["documents"])
 app.include_router(tools_router, prefix="/tools", tags=["tools"])
+app.include_router(agents_router, prefix="/agents", tags=["agents"])

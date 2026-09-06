@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     llm_judge_enabled: bool = False
     llm_default_temperature: float = Field(default=0.3, ge=0.0, le=2.0)
     llm_default_max_tokens: int = Field(default=512, ge=1, le=4096)
+    service_call_allowed_hosts: list[str] = Field(default_factory=lambda: ["localhost", "127.0.0.1"])
+    service_call_allow_unsafe_destinations: bool = False
+    service_call_default_timeout_seconds: int = Field(default=30, ge=1, le=600)
+    service_call_secrets: dict[str, str] = Field(default_factory=dict)
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -44,6 +48,42 @@ class Settings(BaseSettings):
                 except json.JSONDecodeError:
                     pass
             return [origin.strip() for origin in stripped.split(",") if origin.strip()]
+        return value
+
+    @field_validator("service_call_allowed_hosts", mode="before")
+    @classmethod
+    def parse_service_call_allowed_hosts(cls, value):
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, list):
+                        return [str(host).strip().lower() for host in parsed if str(host).strip()]
+                except json.JSONDecodeError:
+                    pass
+            return [host.strip().lower() for host in stripped.split(",") if host.strip()]
+        if isinstance(value, list):
+            return [str(host).strip().lower() for host in value if str(host).strip()]
+        return value
+
+    @field_validator("service_call_secrets", mode="before")
+    @classmethod
+    def parse_service_call_secrets(cls, value):
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return {}
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, dict):
+                    return {
+                        str(key).strip(): str(secret)
+                        for key, secret in parsed.items()
+                        if str(key).strip()
+                    }
+            except json.JSONDecodeError:
+                return {}
         return value
 
 

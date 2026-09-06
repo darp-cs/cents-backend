@@ -3,7 +3,18 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, Uuid, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -13,7 +24,10 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username: Mapped[str] = mapped_column(String(150), unique=True, index=True, nullable=False)
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
+    first_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    last_name: Mapped[str] = mapped_column(String(100), nullable=False)
     hashed_password: Mapped[str] = mapped_column(String(1024), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_superuser: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -91,4 +105,37 @@ class ToolDefinition(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class AgentTemplate(Base):
+    __tablename__ = "agent_templates"
+    __table_args__ = (UniqueConstraint("name", "version", name="uq_agent_templates_name_version"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_template: Mapped[str] = mapped_column(Text, nullable=False)
+    is_valid: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    validation_errors: Mapped[str | None] = mapped_column(Text, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class PlatformConfig(Base):
+    __tablename__ = "platform_config"
+    __table_args__ = (CheckConstraint("max_retries >= 0", name="ck_platform_config_max_retries_non_negative"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    guidelines_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    banned_topics: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    judge_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    max_retries: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )

@@ -49,6 +49,11 @@ flowchart LR
 
 ```text
 app/
+├── agents/
+│   ├── __init__.py
+│   ├── compiler.py
+│   ├── state.py
+│   └── template_schema.py
 ├── auth/
 │   └── users.py
 ├── db/
@@ -64,14 +69,203 @@ app/
 │   ├── graph.py
 │   └── checkpointer.py
 ├── routes/
+│   ├── agents.py
 │   ├── conversations.py
 │   ├── chat.py
+│   ├── configuration.py
 │   ├── documents.py
 │   └── tools.py
 ├── vector_store.py
 ├── config.py
 └── main.py
+
+tests/
+├── test_agent_compiler.py
+└── test_agent_template_schema.py
 ```
+
+## How to understand the app quickly
+
+If you are new to the codebase, read in this order:
+
+1. `app/main.py`: app startup lifecycle, dependency wiring, and route registration.
+2. `app/routes/`: API surface area (auth, conversations, documents, tools, chat).
+3. `app/graph/graph.py`: orchestration graph and retry loop boundaries.
+4. `app/graph/*.py`: per-node behavior (routing, retrieval, generation, judging).
+5. `app/db/models.py` and `app/vector_store.py`: relational vs vector persistence responsibilities.
+6. `app/config.py`: runtime settings and environment-driven behavior.
+
+## Agent workflow templates (schema-first)
+
+The backend now includes formal workflow schema models in `app/agents/template_schema.py`.
+Validated templates are compiled into isolated executable graphs in `app/agents/compiler.py`.
+
+### Why this exists
+
+- Lets platform builders define agent workflows as validated JSON data.
+- Decouples template authoring from hardcoded graph construction logic.
+- Provides deterministic validation errors before runtime execution.
+
+### Template shape
+
+- `AgentTemplate`
+    - `template_version`
+    - `entry_node`
+    - `nodes: list[AgentNode]`
+    - `guardrails`
+- `AgentNode` is a discriminated union on `type` with variants:
+    - `structured_parser`
+    - `condition`
+    - `service_call`
+    - `user_interrupt`
+    - `llm_step`
+    - `terminal_response`
+- Transition rules:
+    - Non-terminal nodes use `next`
+    - `condition` nodes use `branches` and must include a `default` key
+    - `structured_parser` nodes can optionally define `on_failure`
+    - `service_call` nodes can optionally define `on_failure`
+    - `terminal_response` nodes end execution
+
+### Validation behavior
+
+Use `validate_template(raw_json)` to parse and validate templates. It checks:
+
+1. Schema conformance and field-level constraints.
+2. `entry_node` exists in `nodes`.
+3. All `next` and `branches` targets exist.
+4. No unreachable nodes (orphans) from `entry_node`.
+5. At least one `terminal_response` exists.
+6. Every node can reach a `terminal_response`.
+
+### Compilation behavior
+
+- `compile_agent_graph(template)` builds a standalone LangGraph `StateGraph` from the template.
+- Node execution is dispatched by node `type` through a compiler dispatch table.
+- `entry_node` is used as the graph entry point.
+- `next` and `branches` are translated into LangGraph edges.
+- `condition` evaluates a safe allow-listed expression against `parsed_data` and `service_results` (no arbitrary `eval`).
+- Condition expression results resolve to branch keys; unmatched keys and evaluation errors route to `default`.
+- Condition evaluation errors are captured for observability instead of crashing the graph.
+- `structured_parser` supports deterministic extraction (`regex`/keyword) and LLM extraction (`llm`).
+- Parser output is merged into `parsed_data` by field name so multiple parser nodes can contribute fields.
+- Parser failures route to `on_failure` when configured, otherwise the run raises a clear parser error.
+- `terminal_response` renders its template using `parsed_data`, `messages`, and `service_results`, then writes the rendered text to `final_response`.
+- `terminal_response` is an explicit terminal node and always routes to `END` (distinct from interrupt and error paths).
+- `user_interrupt` renders a prompt template from current state and pauses execution using LangGraph interrupts.
+- Interrupt-capable templates are compiled with a persistent SQLite checkpointer based on `DATABASE_URL`, so pause state survives process restarts when resumed with the same `thread_id`.
+- Resuming with `Command(resume=<answer>)` continues from the interrupted node's `next` and merges the answer into `parsed_data[output_key]` plus `messages`.
+- `service_call` supports:
+    - `mode=http`: configured `url` + `method`, with header/body template interpolation from state
+    - `mode=tool`: reference to a registered `ToolDefinition` by `tool_name` or `tool_id`
+- `llm_step` supports a single scoped LLM call with explicit `model_type`, `temperature`, `max_tokens`, and templated `system_prompt`.
+- `llm_step` `system_prompt` placeholders are limited to `parsed_data.*` and `service_results.*` to prevent implicit full-state prompt injection.
+- `llm_step` writes generated text to `messages` and can optionally persist to `parsed_data[output_key]`.
+- `llm_step` LLM client failures route to `on_failure` when configured, otherwise they raise a runtime error.
+- HTTP service calls are SSRF-protected via `SERVICE_CALL_ALLOWED_HOSTS` unless unsafe destinations are explicitly enabled server-side.
+- Sensitive headers/body fields must reference server-side secrets using placeholders (for example `{{ secret.my_api_key }}`), never hardcoded values in templates.
+- Service call responses are stored at `service_results[node_id]`.
+- Non-2xx responses and timeouts route to `on_failure` when configured; otherwise they raise a clear runtime error.
+- Compiled graphs are cached per `(name, version)` for reuse.
+
+### Minimal example
+
+```json
+{
+    "template_version": "1.0",
+    "entry_node": "parse_request",
+    "guardrails": {
+        "max_iterations": 3,
+        "banned_topics_override": ["medical advice"],
+        "judge_enabled_override": true
+    },
+    "nodes": [
+        {
+            "id": "parse_request",
+            "type": "structured_parser",
+            "config": {
+                "source_key": "last_message",
+                "strategy": "regex",
+                "regex_patterns": {
+                    "amount": "amount\\\\s*[:=]\\\\s*(-?\\\\d+(?:\\\\.\\\\d+)?)"
+                },
+                "fields": [{"name": "amount", "type": "number"}]
+            },
+            "on_failure": "fallback_response",
+            "next": "respond"
+        },
+        {
+            "id": "fallback_response",
+            "type": "terminal_response",
+            "config": {"template": "Could not parse input."}
+        },
+        {
+            "id": "respond",
+            "type": "terminal_response",
+            "config": {"template": "Done"}
+        }
+    ]
+}
+```
+
+### Tests for schema validation
+
+Template validation tests live in `tests/test_agent_template_schema.py`.
+
+Run them with:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_agent_template_schema.py -q
+```
+
+## Agent templates API
+
+The backend exposes versioned template management for sub-agent workflows.
+
+Endpoints:
+
+- POST /agents
+    - Creates version 1 for a new template name.
+    - Runs template validation and stores `is_valid` plus `validation_errors`.
+- GET /agents
+    - Returns the latest version for each template name.
+- GET /agents/{name}
+    - Returns latest version details for a single template name.
+- GET /agents/{name}/versions
+    - Returns full version history for a template name.
+- PUT /agents/{name}
+    - Creates a new version instead of mutating existing history.
+- PATCH /agents/{name}/enabled
+    - Enables or disables a template version.
+    - Rejects enable=true for invalid templates with HTTP 400.
+    - Enforces one-active-version policy per agent name:
+        - enabling one version disables all others for that name
+        - disabling the last active version is rejected with HTTP 400
+- DELETE /agents/{name}
+    - Deletes all versions for that template name.
+
+## Platform configuration API
+
+The backend now exposes editable platform guardrails that can be updated without redeploying.
+
+Endpoints:
+
+- GET /configuration
+    - Returns the singleton platform configuration row.
+    - Creates the default row on first read if it does not exist.
+- PUT /configuration
+    - Updates guidelines and guardrails:
+        - guidelines_text
+        - banned_topics
+        - judge_enabled
+        - max_retries
+
+Validation:
+
+- `max_retries` must be greater than or equal to 0.
+- `guidelines_text` is capped at 8000 characters.
+
+All endpoints require an authenticated active user.
 
 ## Python version
 
@@ -161,6 +355,10 @@ Important variables:
 - LLM_JUDGE_ENABLED
 - LLM_DEFAULT_TEMPERATURE
 - LLM_DEFAULT_MAX_TOKENS
+- SERVICE_CALL_ALLOWED_HOSTS
+- SERVICE_CALL_ALLOW_UNSAFE_DESTINATIONS
+- SERVICE_CALL_DEFAULT_TIMEOUT_SECONDS
+- SERVICE_CALL_SECRETS
 
 Default local values already target SQLite + Chroma.
 
