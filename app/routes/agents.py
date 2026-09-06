@@ -14,8 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.compiler import get_compiled_agent_graph, invalidate_compiled_agent_graph
 from app.agents.template_schema import validate_template
 from app.auth.users import current_active_user
+from app.config import settings
 from app.db.base import get_async_session
-from app.db.models import AgentTemplate, User
+from app.db.models import AgentTemplate, PlatformConfig, User
 
 router = APIRouter()
 
@@ -149,6 +150,86 @@ def _extract_first_interrupt_payload(compiled_graph, config: dict[str, Any]) -> 
         raw_value = interrupts[0].value
         return raw_value if isinstance(raw_value, dict) else {"value": raw_value}
     return None
+
+
+def _deserialize_banned_topics(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(parsed, list):
+        return []
+
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
+async def _get_or_create_platform_config(session: AsyncSession) -> PlatformConfig:
+    result = await session.execute(select(PlatformConfig).order_by(PlatformConfig.id.asc()).limit(1))
+    record = result.scalar_one_or_none()
+    if record is not None:
+        return record
+
+    record = PlatformConfig(
+        id=1,
+        guidelines_text="",
+        banned_topics="[]",
+        judge_enabled=settings.llm_judge_enabled,
+        max_retries=3,
+    )
+    session.add(record)
+    await session.commit()
+    await session.refresh(record)
+    return record
+
+
+async def _build_platform_guardrails(session: AsyncSession) -> dict[str, Any]:
+    record = await _get_or_create_platform_config(session)
+    return {
+        "guidelines_text": record.guidelines_text,
+        "banned_topics": _deserialize_banned_topics(record.banned_topics),
+        "judge_enabled": record.judge_enabled,
+        "max_iterations": record.max_retries,
+    }
+
+
+def _build_template_guardrails(raw_template: dict[str, Any]) -> dict[str, Any]:
+    raw_guardrails = raw_template.get("guardrails")
+    if not isinstance(raw_guardrails, dict):
+        return {
+            "max_iterations": None,
+            "banned_topics_override": None,
+            "judge_enabled_override": None,
+        }
+
+    template_max_iterations = raw_guardrails.get("max_iterations")
+    if isinstance(template_max_iterations, bool):
+        template_max_iterations = None
+    elif template_max_iterations is not None:
+        try:
+            template_max_iterations = int(template_max_iterations)
+        except (TypeError, ValueError):
+            template_max_iterations = None
+
+    raw_banned_topics_override = raw_guardrails.get("banned_topics_override")
+    banned_topics_override = (
+        [str(topic).strip() for topic in raw_banned_topics_override if str(topic).strip()]
+        if isinstance(raw_banned_topics_override, list)
+        else None
+    )
+
+    judge_enabled_override = raw_guardrails.get("judge_enabled_override")
+    if judge_enabled_override is not None:
+        judge_enabled_override = bool(judge_enabled_override)
+
+    return {
+        "max_iterations": template_max_iterations,
+        "banned_topics_override": banned_topics_override,
+        "judge_enabled_override": judge_enabled_override,
+    }
 
 
 async def _resolve_runnable_template(
@@ -348,6 +429,8 @@ async def run_agent(
     thread_id = payload.thread_id.strip() if payload.thread_id else (
         f"user:{user.id}:agent:{normalized_name}:{uuid.uuid4()}"
     )
+    platform_guardrails = await _build_platform_guardrails(session)
+    template_guardrails = _build_template_guardrails(raw_template)
 
     state = {
         "input": payload.input,
@@ -358,6 +441,8 @@ async def run_agent(
         "interrupt_payload": None,
         "final_response": "",
         "node_llm_configs": dict(payload.node_llm_configs),
+        "platform_guardrails": platform_guardrails,
+        "template_guardrails": template_guardrails,
     }
     config = {"configurable": {"thread_id": thread_id}}
 
@@ -375,6 +460,16 @@ async def run_agent(
             "thread_id": thread_id,
             "version": record.version,
             "interrupt": interrupt_payload,
+            "state": result,
+        }
+
+    error_event = result.get("error_event")
+    if isinstance(error_event, dict):
+        return {
+            "status": "failed",
+            "thread_id": thread_id,
+            "version": record.version,
+            "error": error_event,
             "state": result,
         }
 
@@ -424,6 +519,16 @@ async def resume_agent(
             "thread_id": payload.thread_id.strip(),
             "version": record.version,
             "interrupt": interrupt_payload,
+            "state": result,
+        }
+
+    error_event = result.get("error_event")
+    if isinstance(error_event, dict):
+        return {
+            "status": "failed",
+            "thread_id": payload.thread_id.strip(),
+            "version": record.version,
+            "error": error_event,
             "state": result,
         }
 

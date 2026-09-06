@@ -17,3 +17,11 @@ class SubAgentState(TypedDict, total=False):
     interrupt_payload: dict[str, Any] | None
     final_response: str
     node_llm_configs: dict[str, NodeLLMConfig]
+    platform_guardrails: dict[str, Any]
+    template_guardrails: dict[str, Any]
+    guardrail_policy: dict[str, Any]
+    guardrail_verdict: dict[str, Any] | None
+    metric_events: list[dict[str, Any]]
+    error_event: dict[str, Any] | None
+    run_status: str
+    _halt_execution: bool
