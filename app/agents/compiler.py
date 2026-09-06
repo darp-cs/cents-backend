@@ -40,6 +40,9 @@ NodeExecutor = Callable[[AgentNode, SubAgentState], SubAgentState]
 ToolExecutor = Callable[[dict[str, Any], SubAgentState], Any]
 CompiledGraphCacheKey = tuple[str, int]
 
+_HALT_ROUTE_KEY = "__halt__"
+_GUARDRAIL_HALT_NODE_ID = "__guardrail_halt__"
+
 _COMPILED_GRAPH_CACHE: dict[CompiledGraphCacheKey, CompiledStateGraph] = {}
 _TOOL_EXECUTORS_BY_ID: dict[str, ToolExecutor] = {}
 _TOOL_EXECUTORS_BY_NAME: dict[str, ToolExecutor] = {}
@@ -47,18 +50,21 @@ _TOOL_EXECUTORS_BY_NAME: dict[str, ToolExecutor] = {}
 
 def compile_agent_graph(template: AgentTemplate) -> CompiledStateGraph:
     workflow = StateGraph(SubAgentState)
+    workflow.add_node(_GUARDRAIL_HALT_NODE_ID, _execute_guardrail_halt)
 
     for node in template.nodes:
-        workflow.add_node(node.id, _build_node_handler(node))
+        workflow.add_node(node.id, _build_node_handler(node, template))
 
     workflow.set_entry_point(template.entry_node)
 
     for node in template.nodes:
         if isinstance(node, ConditionNode):
+            branches_with_halt = dict(node.branches)
+            branches_with_halt[_HALT_ROUTE_KEY] = _GUARDRAIL_HALT_NODE_ID
             workflow.add_conditional_edges(
                 node.id,
                 _build_condition_router(node),
-                cast(dict[Hashable, str], node.branches),
+                cast(dict[Hashable, str], branches_with_halt),
             )
             continue
 
@@ -69,6 +75,7 @@ def compile_agent_graph(template: AgentTemplate) -> CompiledStateGraph:
                 {
                     "success": node.next,
                     "failure": node.on_failure,
+                    _HALT_ROUTE_KEY: _GUARDRAIL_HALT_NODE_ID,
                 },
             )
             continue
@@ -80,6 +87,7 @@ def compile_agent_graph(template: AgentTemplate) -> CompiledStateGraph:
                 {
                     "success": node.next,
                     "failure": node.on_failure,
+                    _HALT_ROUTE_KEY: _GUARDRAIL_HALT_NODE_ID,
                 },
             )
             continue
@@ -91,6 +99,7 @@ def compile_agent_graph(template: AgentTemplate) -> CompiledStateGraph:
                 {
                     "success": node.next,
                     "failure": node.on_failure,
+                    _HALT_ROUTE_KEY: _GUARDRAIL_HALT_NODE_ID,
                 },
             )
             continue
@@ -99,7 +108,16 @@ def compile_agent_graph(template: AgentTemplate) -> CompiledStateGraph:
             workflow.add_edge(node.id, END)
             continue
 
-        workflow.add_edge(node.id, node.next)
+        workflow.add_conditional_edges(
+            node.id,
+            _build_next_or_halt_router(),
+            {
+                "next": node.next,
+                _HALT_ROUTE_KEY: _GUARDRAIL_HALT_NODE_ID,
+            },
+        )
+
+    workflow.add_edge(_GUARDRAIL_HALT_NODE_ID, END)
 
     requires_checkpointing = any(isinstance(node, UserInterruptNode) for node in template.nodes)
     if not requires_checkpointing:
@@ -155,17 +173,37 @@ def clear_tool_executors() -> None:
     _TOOL_EXECUTORS_BY_NAME.clear()
 
 
-def _build_node_handler(node: AgentNode) -> Callable[[SubAgentState], SubAgentState]:
+def _build_node_handler(node: AgentNode, template: AgentTemplate) -> Callable[[SubAgentState], SubAgentState]:
     executor = _NODE_EXECUTORS[node.type]
 
     def _handler(state: SubAgentState) -> SubAgentState:
-        return executor(node, state)
+        state_with_guardrails = _ensure_guardrail_policy(state, template)
+        if _should_halt_execution(state_with_guardrails):
+            return state_with_guardrails
+
+        if _has_reached_iteration_limit(state_with_guardrails):
+            return _mark_iteration_limit_exceeded(state_with_guardrails, node.id)
+
+        next_state = _touch_iteration(state_with_guardrails, node.id)
+        if _should_halt_execution(next_state):
+            return next_state
+
+        return executor(node, next_state)
 
     return _handler
 
 
+def _build_next_or_halt_router() -> Callable[[SubAgentState], str]:
+    def _router(state: SubAgentState) -> str:
+        return _HALT_ROUTE_KEY if _should_halt_execution(state) else "next"
+
+    return _router
+
+
 def _build_condition_router(node: ConditionNode) -> Callable[[SubAgentState], str]:
     def _router(state: SubAgentState) -> str:
+        if _should_halt_execution(state):
+            return _HALT_ROUTE_KEY
         return _resolve_condition_route(node, state)
 
     return _router
@@ -173,6 +211,8 @@ def _build_condition_router(node: ConditionNode) -> Callable[[SubAgentState], st
 
 def _build_structured_parser_router(node: StructuredParserNode) -> Callable[[SubAgentState], str]:
     def _router(state: SubAgentState) -> str:
+        if _should_halt_execution(state):
+            return _HALT_ROUTE_KEY
         return _resolve_structured_parser_route(node.id, state)
 
     return _router
@@ -180,6 +220,8 @@ def _build_structured_parser_router(node: StructuredParserNode) -> Callable[[Sub
 
 def _build_service_call_router(node_id: str) -> Callable[[SubAgentState], str]:
     def _router(state: SubAgentState) -> str:
+        if _should_halt_execution(state):
+            return _HALT_ROUTE_KEY
         return _resolve_service_call_route(node_id, state)
 
     return _router
@@ -187,6 +229,8 @@ def _build_service_call_router(node_id: str) -> Callable[[SubAgentState], str]:
 
 def _build_llm_step_router(node_id: str) -> Callable[[SubAgentState], str]:
     def _router(state: SubAgentState) -> str:
+        if _should_halt_execution(state):
+            return _HALT_ROUTE_KEY
         return _resolve_llm_step_route(node_id, state)
 
     return _router
@@ -400,7 +444,8 @@ def _record_condition_error(parsed_data: dict[str, Any], node_id: str, message: 
     parsed_data["__condition_errors__"] = condition_errors
 
 
-def _touch_iteration(state: SubAgentState) -> SubAgentState:
+def _touch_iteration(state: SubAgentState, node_id: str) -> SubAgentState:
+    del node_id
     next_state = cast(SubAgentState, dict(state))
     raw_count = next_state.get("iteration_count", 0)
     try:
@@ -408,13 +453,187 @@ def _touch_iteration(state: SubAgentState) -> SubAgentState:
     except (TypeError, ValueError):
         current_count = 0
 
-    next_state["iteration_count"] = current_count + 1
+    next_count = current_count + 1
+    next_state["iteration_count"] = next_count
     return next_state
+
+
+def _has_reached_iteration_limit(state: SubAgentState) -> bool:
+    policy = state.get("guardrail_policy", {})
+    if not isinstance(policy, dict):
+        return False
+
+    max_iterations = _coerce_int(policy.get("max_iterations", 3), fallback=3)
+    if max_iterations < 1:
+        max_iterations = 1
+
+    current_count = _coerce_int(state.get("iteration_count", 0), fallback=0)
+    return current_count >= max_iterations
+
+
+def _mark_iteration_limit_exceeded(state: SubAgentState, node_id: str) -> SubAgentState:
+    policy = state.get("guardrail_policy", {})
+    max_iterations_raw = policy.get("max_iterations", 3) if isinstance(policy, dict) else 3
+    max_iterations = _coerce_int(max_iterations_raw, fallback=3)
+    if max_iterations < 1:
+        max_iterations = 1
+
+    current_count = _coerce_int(state.get("iteration_count", 0), fallback=0)
+    event = {
+        "type": "iteration_limit_exceeded",
+        "node_id": node_id,
+        "iteration_count": current_count,
+        "max_iterations": max_iterations,
+        "message": (
+            f"Sub-agent halted at iteration {current_count} because it reached max_iterations={max_iterations}."
+        ),
+    }
+    return _mark_guardrail_failure(state, event)
+
+
+def _ensure_guardrail_policy(state: SubAgentState, template: AgentTemplate) -> SubAgentState:
+    existing_policy = state.get("guardrail_policy")
+    if isinstance(existing_policy, dict):
+        return state
+
+    next_state = cast(SubAgentState, dict(state))
+    platform_guardrails = state.get("platform_guardrails")
+    normalized_platform = _normalize_platform_guardrails(platform_guardrails)
+
+    template_override = state.get("template_guardrails")
+    template_banned_topics = template.guardrails.banned_topics_override
+    template_judge_override = template.guardrails.judge_enabled_override
+    template_max_iterations = template.guardrails.max_iterations
+
+    if isinstance(template_override, dict):
+        if "banned_topics_override" in template_override:
+            raw_override_topics = template_override.get("banned_topics_override")
+            if isinstance(raw_override_topics, list):
+                template_banned_topics = [
+                    str(topic).strip() for topic in raw_override_topics if str(topic).strip()
+                ]
+            else:
+                template_banned_topics = None
+
+        if "judge_enabled_override" in template_override:
+            raw_judge_override = template_override.get("judge_enabled_override")
+            template_judge_override = bool(raw_judge_override) if raw_judge_override is not None else None
+
+        if "max_iterations" in template_override:
+            raw_max_iterations = template_override.get("max_iterations")
+            if raw_max_iterations is None:
+                template_max_iterations = None
+            else:
+                parsed_max_iterations = _coerce_int(raw_max_iterations, fallback=0)
+                template_max_iterations = parsed_max_iterations if parsed_max_iterations > 0 else None
+
+    merged_topics = _merge_topics(
+        normalized_platform["banned_topics"],
+        template_banned_topics or [],
+    )
+
+    platform_default_iterations = _coerce_int(normalized_platform["max_iterations"], fallback=3)
+    if platform_default_iterations < 1:
+        platform_default_iterations = 1
+    effective_max_iterations = template_max_iterations or platform_default_iterations
+
+    effective_judge_enabled = bool(normalized_platform["judge_enabled"]) or bool(template_judge_override)
+
+    next_state["guardrail_policy"] = {
+        "guidelines_text": normalized_platform["guidelines_text"],
+        "banned_topics": merged_topics,
+        "judge_enabled": effective_judge_enabled,
+        "max_iterations": effective_max_iterations,
+        "template_banned_topics_override": template_banned_topics or [],
+        "template_judge_enabled_override": template_judge_override,
+        "template_max_iterations": template_max_iterations,
+        "platform_default_max_iterations": platform_default_iterations,
+    }
+    return next_state
+
+
+def _normalize_platform_guardrails(raw_platform_guardrails: Any) -> dict[str, Any]:
+    if not isinstance(raw_platform_guardrails, dict):
+        return {
+            "guidelines_text": "",
+            "banned_topics": [],
+            "judge_enabled": settings.llm_judge_enabled,
+            "max_iterations": 3,
+        }
+
+    raw_topics = raw_platform_guardrails.get("banned_topics", [])
+    topics: list[str] = []
+    if isinstance(raw_topics, list):
+        topics = [str(topic).strip() for topic in raw_topics if str(topic).strip()]
+
+    return {
+        "guidelines_text": str(raw_platform_guardrails.get("guidelines_text", "")).strip(),
+        "banned_topics": topics,
+        "judge_enabled": bool(raw_platform_guardrails.get("judge_enabled", settings.llm_judge_enabled)),
+        "max_iterations": _coerce_int(raw_platform_guardrails.get("max_iterations", 3), fallback=3),
+    }
+
+
+def _merge_topics(platform_topics: list[str], template_topics: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for topic in [*platform_topics, *template_topics]:
+        normalized = topic.strip()
+        if not normalized:
+            continue
+        dedupe_key = normalized.lower()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        merged.append(normalized)
+    return merged
+
+
+def _coerce_int(value: Any, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _should_halt_execution(state: SubAgentState) -> bool:
+    return bool(state.get("_halt_execution", False))
+
+
+def _mark_guardrail_failure(state: SubAgentState, event: dict[str, Any]) -> SubAgentState:
+    next_state = cast(SubAgentState, dict(state))
+    parsed_data = dict(next_state.get("parsed_data", {}))
+
+    guardrail_events = parsed_data.get("__guardrail_events__", [])
+    if not isinstance(guardrail_events, list):
+        guardrail_events = []
+    guardrail_events.append(event)
+    parsed_data["__guardrail_events__"] = guardrail_events
+
+    next_state["parsed_data"] = parsed_data
+    next_state["error_event"] = event
+    next_state["guardrail_verdict"] = {
+        "verdict": "fail",
+        "reason": event.get("type", "guardrail_failure"),
+    }
+
+    metric_events = list(next_state.get("metric_events", []))
+    metric_events.append(event)
+    next_state["metric_events"] = metric_events
+
+    next_state["_halt_execution"] = True
+    next_state["run_status"] = "failed"
+    next_state["final_response"] = ""
+    return next_state
+
+
+def _execute_guardrail_halt(state: SubAgentState) -> SubAgentState:
+    return state
 
 
 def _execute_structured_parser(node: AgentNode, state: SubAgentState) -> SubAgentState:
     assert isinstance(node, StructuredParserNode)
-    next_state = _touch_iteration(state)
+    next_state = cast(SubAgentState, dict(state))
     source_text = _resolve_source_text(node.config, next_state)
 
     try:
@@ -515,7 +734,7 @@ def _extract_field_value(
 
 def _extract_with_llm(node: StructuredParserNode, source_text: str, state: SubAgentState) -> dict[str, Any]:
     model_type, model = _resolve_parser_model(node, state)
-    system_prompt = _build_parser_system_prompt(node)
+    system_prompt = _build_parser_system_prompt(node, state)
     request_payload: dict[str, Any] = {
         "messages": [{"role": "user", "content": source_text}],
         "system_prompt": system_prompt,
@@ -584,7 +803,7 @@ def _resolve_parser_model(node: StructuredParserNode, state: SubAgentState) -> t
     return model_type, (model or None)
 
 
-def _build_parser_system_prompt(node: StructuredParserNode) -> str:
+def _build_parser_system_prompt(node: StructuredParserNode, state: SubAgentState) -> str:
     field_specs: list[str] = []
     for field in node.config.fields:
         requirement = "required" if field.required else "optional"
@@ -593,12 +812,38 @@ def _build_parser_system_prompt(node: StructuredParserNode) -> str:
         field_specs.append(f"- {field.name}: {field.type} ({requirement}){enum_values}{description}")
 
     instructions = node.config.llm_prompt_instructions or ""
-    return (
+    base_prompt = (
         "Extract structured data and return JSON only. Do not include markdown, code fences, or extra text.\n"
         f"Schema:\n{chr(10).join(field_specs)}\n"
         "Only include keys present in the schema."
         + (f"\nAdditional instructions: {instructions}" if instructions.strip() else "")
     )
+
+    guardrails = _build_guardrail_prompt_prefix(state)
+    if not guardrails:
+        return base_prompt
+    return f"{guardrails}\n\n{base_prompt}"
+
+
+def _build_guardrail_prompt_prefix(state: SubAgentState) -> str:
+    policy = state.get("guardrail_policy", {})
+    if not isinstance(policy, dict):
+        return ""
+
+    guidelines_text = str(policy.get("guidelines_text", "")).strip()
+    raw_topics = policy.get("banned_topics", [])
+    topics = [str(topic).strip() for topic in raw_topics if str(topic).strip()] if isinstance(raw_topics, list) else []
+
+    sections: list[str] = []
+    if guidelines_text:
+        sections.append(f"Guidelines:\n{guidelines_text}")
+    if topics:
+        sections.append("Banned topics: " + ", ".join(topics))
+
+    if not sections:
+        return ""
+
+    return "Platform guardrails (mandatory):\n" + "\n".join(sections)
 
 
 def _unwrap_json_block(raw_text: str) -> str:
@@ -739,7 +984,7 @@ def _run_async(coro):
 
 def _execute_condition(node: AgentNode, state: SubAgentState) -> SubAgentState:
     assert isinstance(node, ConditionNode)
-    next_state = _touch_iteration(state)
+    next_state = cast(SubAgentState, dict(state))
     parsed_data = next_state.get("parsed_data", {})
     normalized_parsed_data = dict(parsed_data) if isinstance(parsed_data, dict) else {}
 
@@ -757,7 +1002,7 @@ def _execute_condition(node: AgentNode, state: SubAgentState) -> SubAgentState:
 
 def _execute_service_call(node: AgentNode, state: SubAgentState) -> SubAgentState:
     assert isinstance(node, ServiceCallNode)
-    next_state = _touch_iteration(state)
+    next_state = cast(SubAgentState, dict(state))
     try:
         response_payload = _execute_service_call_request(node.config, next_state)
     except RuntimeError as exc:
@@ -1056,6 +1301,7 @@ async def _fetch_tool_definition(tool_name: str | None, tool_id: str | None) -> 
 
 def _execute_user_interrupt(node: AgentNode, state: SubAgentState) -> SubAgentState:
     assert isinstance(node, UserInterruptNode)
+    next_state = cast(SubAgentState, dict(state))
     rendered_prompt = str(_render_template_value(node.config.prompt, state)).strip()
     if not rendered_prompt:
         raise RuntimeError(f"User interrupt node '{node.id}' rendered an empty prompt.")
@@ -1070,8 +1316,6 @@ def _execute_user_interrupt(node: AgentNode, state: SubAgentState) -> SubAgentSt
             "choices": node.config.choices,
         }
     )
-
-    next_state = _touch_iteration(state)
 
     parsed_data = dict(next_state.get("parsed_data", {}))
     parsed_data[node.config.output_key] = answer
@@ -1115,9 +1359,15 @@ def _stringify_interrupt_answer(answer: Any) -> str:
 
 def _execute_llm_step(node: AgentNode, state: SubAgentState) -> SubAgentState:
     assert isinstance(node, LLMStepNode)
-    next_state = _touch_iteration(state)
+    next_state = cast(SubAgentState, dict(state))
 
     rendered_system_prompt = _render_llm_step_system_prompt(node.config.system_prompt, next_state)
+    guardrail_prompt = _build_guardrail_prompt_prefix(next_state)
+    effective_system_prompt = (
+        f"{guardrail_prompt}\n\nTask:\n{rendered_system_prompt}"
+        if guardrail_prompt
+        else rendered_system_prompt
+    )
     request_payload: dict[str, Any] = {
         "messages": [
             {
@@ -1125,7 +1375,7 @@ def _execute_llm_step(node: AgentNode, state: SubAgentState) -> SubAgentState:
                 "content": "Complete exactly the task described by the system prompt.",
             }
         ],
-        "system_prompt": rendered_system_prompt,
+        "system_prompt": effective_system_prompt,
         "model_folder": node.config.model_type,
         "temperature": node.config.temperature,
         "max_tokens": node.config.max_tokens,
@@ -1242,9 +1492,45 @@ def _resolve_llm_step_reference(reference: str, state: SubAgentState) -> Any:
 
 def _execute_terminal_response(node: AgentNode, state: SubAgentState) -> SubAgentState:
     assert isinstance(node, TerminalResponseNode)
-    next_state = _touch_iteration(state)
-    next_state["final_response"] = _render_terminal_response_template(node.config.template, next_state)
+    next_state = cast(SubAgentState, dict(state))
+    rendered_response = _render_terminal_response_template(node.config.template, next_state)
+
+    violated_topic = _find_banned_topic_violation(rendered_response, next_state)
+    if violated_topic is not None:
+        event = {
+            "type": "guardrail_violation",
+            "rule": "banned_topic",
+            "node_id": node.id,
+            "topic": violated_topic,
+            "message": f"Final response violated banned topic '{violated_topic}'.",
+        }
+
+        parsed_data = dict(next_state.get("parsed_data", {}))
+        parsed_data["__blocked_final_response__"] = rendered_response
+        next_state["parsed_data"] = parsed_data
+        return _mark_guardrail_failure(next_state, event)
+
+    next_state["final_response"] = rendered_response
     return next_state
+
+
+def _find_banned_topic_violation(final_response: str, state: SubAgentState) -> str | None:
+    policy = state.get("guardrail_policy", {})
+    if not isinstance(policy, dict):
+        return None
+
+    raw_topics = policy.get("banned_topics", [])
+    if not isinstance(raw_topics, list):
+        return None
+
+    normalized_response = final_response.lower()
+    for raw_topic in raw_topics:
+        topic = str(raw_topic).strip()
+        if not topic:
+            continue
+        if topic.lower() in normalized_response:
+            return topic
+    return None
 
 
 def _render_terminal_response_template(template: str, state: SubAgentState) -> str:

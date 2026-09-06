@@ -240,6 +240,61 @@ def test_structured_parser_llm_strategy_parses_json(monkeypatch: pytest.MonkeyPa
     assert "return JSON only" in captured_payload["system_prompt"]
 
 
+def test_structured_parser_llm_prompt_includes_platform_guardrails(monkeypatch: pytest.MonkeyPatch) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "parse",
+        "nodes": [
+            {
+                "id": "parse",
+                "type": "structured_parser",
+                "config": {
+                    "source_key": "input",
+                    "strategy": "llm",
+                    "fields": [{"name": "amount", "type": "number"}],
+                },
+                "next": "respond",
+            },
+            {
+                "id": "respond",
+                "type": "terminal_response",
+                "config": {"template": "done"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    captured_payload: dict[str, Any] = {}
+
+    async def _fake_generate_text(payload: dict[str, Any]) -> dict[str, Any]:
+        captured_payload.update(payload)
+        return {"text": '{"amount": 12}'}
+
+    monkeypatch.setattr("app.agents.compiler.generate_text", _fake_generate_text)
+
+    state = _base_state()
+    state["platform_guardrails"] = {
+        "guidelines_text": "Never provide medical or legal advice.",
+        "banned_topics": ["politics"],
+        "judge_enabled": False,
+        "max_iterations": 5,
+    }
+    state["template_guardrails"] = {
+        "max_iterations": None,
+        "banned_topics_override": ["medical advice"],
+        "judge_enabled_override": None,
+    }
+
+    compiled_graph = compile_agent_graph(template)
+    compiled_graph.invoke(state)
+
+    prompt = str(captured_payload["system_prompt"])
+    assert "Platform guardrails (mandatory):" in prompt
+    assert "Never provide medical or legal advice." in prompt
+    assert "politics" in prompt
+    assert "medical advice" in prompt
+
+
 def test_structured_parser_on_failure_routes_to_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     template_payload = {
         "template_version": "1.0",
@@ -383,6 +438,65 @@ def test_llm_step_calls_llm_service_and_persists_output(monkeypatch: pytest.Monk
     ]
     assert result["messages"][-1] == {"role": "assistant", "content": "expense"}
     assert result["parsed_data"]["classification"] == "expense"
+
+
+def test_llm_step_prompt_includes_platform_guardrails(monkeypatch: pytest.MonkeyPatch) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "draft_reply",
+        "nodes": [
+            {
+                "id": "draft_reply",
+                "type": "llm_step",
+                "config": {
+                    "model_type": "text-generation",
+                    "system_prompt": "Summarize {{ parsed_data.topic }}",
+                    "temperature": 0.1,
+                    "max_tokens": 48,
+                    "output_key": "summary",
+                },
+                "next": "respond",
+            },
+            {
+                "id": "respond",
+                "type": "terminal_response",
+                "config": {"template": "done"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+    captured_payload: dict[str, Any] = {}
+
+    async def _fake_generate_text(payload: dict[str, Any]) -> dict[str, Any]:
+        captured_payload.update(payload)
+        return {"text": "ok"}
+
+    monkeypatch.setattr("app.agents.compiler.generate_text", _fake_generate_text)
+
+    state = _base_state()
+    state["parsed_data"] = {"topic": "expenses"}
+    state["platform_guardrails"] = {
+        "guidelines_text": "Remain factual.",
+        "banned_topics": ["politics"],
+        "judge_enabled": False,
+        "max_iterations": 6,
+    }
+    state["template_guardrails"] = {
+        "max_iterations": None,
+        "banned_topics_override": ["medical advice"],
+        "judge_enabled_override": True,
+    }
+
+    compiled_graph = compile_agent_graph(template)
+    compiled_graph.invoke(state)
+
+    prompt = str(captured_payload["system_prompt"])
+    assert "Platform guardrails (mandatory):" in prompt
+    assert "Remain factual." in prompt
+    assert "politics" in prompt
+    assert "medical advice" in prompt
+    assert "Task:" in prompt
+    assert "Summarize expenses" in prompt
 
 
 def test_llm_step_without_output_key_only_appends_message(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -960,6 +1074,136 @@ def test_condition_missing_field_routes_to_default_and_records_error() -> None:
 
     assert result["final_response"] == "FALLBACK"
     assert "route" in result["parsed_data"]["__condition_errors__"]
+
+
+def test_max_iterations_falls_back_to_platform_default_when_template_omits_limit() -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "loop",
+        "guardrails": {
+            "banned_topics_override": ["medical advice"],
+            "judge_enabled_override": False,
+        },
+        "nodes": [
+            {
+                "id": "loop",
+                "type": "condition",
+                "config": {"expression": "true"},
+                "branches": {
+                    "true": "loop",
+                    "default": "done",
+                },
+            },
+            {
+                "id": "done",
+                "type": "terminal_response",
+                "config": {"template": "complete"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+    state = _base_state()
+    state["platform_guardrails"] = {
+        "guidelines_text": "",
+        "banned_topics": [],
+        "judge_enabled": False,
+        "max_iterations": 2,
+    }
+    state["template_guardrails"] = {
+        "max_iterations": None,
+        "banned_topics_override": ["medical advice"],
+        "judge_enabled_override": False,
+    }
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(state)
+
+    assert result["iteration_count"] == 2
+    assert result["run_status"] == "failed"
+    assert result["error_event"]["type"] == "iteration_limit_exceeded"
+    assert result["error_event"]["max_iterations"] == 2
+
+
+def test_template_iteration_limit_exceeded_terminates_with_error_event() -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "loop",
+        "guardrails": {
+            "max_iterations": 3,
+        },
+        "nodes": [
+            {
+                "id": "loop",
+                "type": "condition",
+                "config": {"expression": "true"},
+                "branches": {
+                    "true": "loop",
+                    "default": "done",
+                },
+            },
+            {
+                "id": "done",
+                "type": "terminal_response",
+                "config": {"template": "complete"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+    state = _base_state()
+    state["platform_guardrails"] = {
+        "guidelines_text": "",
+        "banned_topics": [],
+        "judge_enabled": False,
+        "max_iterations": 9,
+    }
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(state)
+
+    assert result["iteration_count"] == 3
+    assert result["run_status"] == "failed"
+    assert result["error_event"]["type"] == "iteration_limit_exceeded"
+    assert result["error_event"]["max_iterations"] == 3
+
+
+def test_banned_topics_override_merges_with_platform_topics() -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "respond",
+        "guardrails": {
+            "banned_topics_override": ["stocks"],
+        },
+        "nodes": [
+            {
+                "id": "respond",
+                "type": "terminal_response",
+                "config": {
+                    "template": "This response mentions stocks and politics.",
+                },
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+    state = _base_state()
+    state["platform_guardrails"] = {
+        "guidelines_text": "",
+        "banned_topics": ["politics"],
+        "judge_enabled": False,
+        "max_iterations": 6,
+    }
+    state["template_guardrails"] = {
+        "max_iterations": None,
+        "banned_topics_override": ["stocks"],
+        "judge_enabled_override": None,
+    }
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(state)
+
+    assert result["guardrail_policy"]["banned_topics"] == ["politics", "stocks"]
+    assert result["run_status"] == "failed"
+    assert result["error_event"]["type"] == "guardrail_violation"
+    assert result["final_response"] == ""
 
 
 def test_compiled_graphs_are_isolated_per_template(linear_template_dict: dict) -> None:
