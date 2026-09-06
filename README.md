@@ -49,6 +49,9 @@ flowchart LR
 
 ```text
 app/
+├── agents/
+│   ├── __init__.py
+│   └── template_schema.py
 ├── auth/
 │   └── users.py
 ├── db/
@@ -71,6 +74,101 @@ app/
 ├── vector_store.py
 ├── config.py
 └── main.py
+
+tests/
+└── test_agent_template_schema.py
+```
+
+## How to understand the app quickly
+
+If you are new to the codebase, read in this order:
+
+1. `app/main.py`: app startup lifecycle, dependency wiring, and route registration.
+2. `app/routes/`: API surface area (auth, conversations, documents, tools, chat).
+3. `app/graph/graph.py`: orchestration graph and retry loop boundaries.
+4. `app/graph/*.py`: per-node behavior (routing, retrieval, generation, judging).
+5. `app/db/models.py` and `app/vector_store.py`: relational vs vector persistence responsibilities.
+6. `app/config.py`: runtime settings and environment-driven behavior.
+
+## Agent workflow templates (schema-first)
+
+The backend now includes formal workflow schema models in `app/agents/template_schema.py`.
+
+### Why this exists
+
+- Lets platform builders define agent workflows as validated JSON data.
+- Decouples template authoring from hardcoded graph construction logic.
+- Provides deterministic validation errors before runtime execution.
+
+### Template shape
+
+- `AgentTemplate`
+    - `template_version`
+    - `entry_node`
+    - `nodes: list[AgentNode]`
+    - `guardrails`
+- `AgentNode` is a discriminated union on `type` with variants:
+    - `structured_parser`
+    - `condition`
+    - `service_call`
+    - `user_interrupt`
+    - `llm_step`
+    - `terminal_response`
+- Transition rules:
+    - Non-terminal nodes use `next`
+    - `condition` nodes use `branches`
+    - `terminal_response` nodes end execution
+
+### Validation behavior
+
+Use `validate_template(raw_json)` to parse and validate templates. It checks:
+
+1. Schema conformance and field-level constraints.
+2. `entry_node` exists in `nodes`.
+3. All `next` and `branches` targets exist.
+4. No unreachable nodes (orphans) from `entry_node`.
+5. At least one `terminal_response` exists.
+6. Every node can reach a `terminal_response`.
+
+### Minimal example
+
+```json
+{
+    "template_version": "1.0",
+    "entry_node": "parse_request",
+    "guardrails": {
+        "max_iterations": 3,
+        "banned_topics_override": ["medical advice"],
+        "judge_enabled_override": true
+    },
+    "nodes": [
+        {
+            "id": "parse_request",
+            "type": "structured_parser",
+            "config": {
+                "source_key": "last_message",
+                "output_key": "parsed_request",
+                "fields": [{"name": "amount", "type": "number"}]
+            },
+            "next": "respond"
+        },
+        {
+            "id": "respond",
+            "type": "terminal_response",
+            "config": {"template": "Done"}
+        }
+    ]
+}
+```
+
+### Tests for schema validation
+
+Template validation tests live in `tests/test_agent_template_schema.py`.
+
+Run them with:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_agent_template_schema.py -q
 ```
 
 ## Python version
