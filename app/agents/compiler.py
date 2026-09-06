@@ -13,6 +13,7 @@ from typing import Any, Hashable, cast
 import httpx
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import interrupt
 from sqlalchemy import select
 
 from app.agents.state import SubAgentState
@@ -32,6 +33,7 @@ from app.agents.template_schema import (
 from app.config import settings
 from app.db.base import AsyncSessionLocal
 from app.db.models import ToolDefinition
+from app.graph.checkpointer import ensure_sync_checkpointer_ready
 from app.llm.client import LLMClientError, generate_text
 
 NodeExecutor = Callable[[AgentNode, SubAgentState], SubAgentState]
@@ -99,7 +101,12 @@ def compile_agent_graph(template: AgentTemplate) -> CompiledStateGraph:
 
         workflow.add_edge(node.id, node.next)
 
-    return workflow.compile()
+    requires_checkpointing = any(isinstance(node, UserInterruptNode) for node in template.nodes)
+    if not requires_checkpointing:
+        return workflow.compile()
+
+    checkpointer = ensure_sync_checkpointer_ready()
+    return workflow.compile(checkpointer=checkpointer) if checkpointer is not None else workflow.compile()
 
 
 def get_compiled_agent_graph(name: str, version: int, template: AgentTemplate) -> CompiledStateGraph:
@@ -1049,13 +1056,61 @@ async def _fetch_tool_definition(tool_name: str | None, tool_id: str | None) -> 
 
 def _execute_user_interrupt(node: AgentNode, state: SubAgentState) -> SubAgentState:
     assert isinstance(node, UserInterruptNode)
+    rendered_prompt = str(_render_template_value(node.config.prompt, state)).strip()
+    if not rendered_prompt:
+        raise RuntimeError(f"User interrupt node '{node.id}' rendered an empty prompt.")
+
+    answer = interrupt(
+        {
+            "node_id": node.id,
+            "type": "user_interrupt",
+            "prompt": rendered_prompt,
+            "output_key": node.config.output_key,
+            "expected_type": node.config.expected_type,
+            "choices": node.config.choices,
+        }
+    )
+
     next_state = _touch_iteration(state)
+
+    parsed_data = dict(next_state.get("parsed_data", {}))
+    parsed_data[node.config.output_key] = answer
+    next_state["parsed_data"] = parsed_data
+
+    messages = list(next_state.get("messages", []))
+    messages.append(
+        {
+            "role": "assistant",
+            "content": rendered_prompt,
+        }
+    )
+    messages.append(
+        {
+            "role": "user",
+            "content": _stringify_interrupt_answer(answer),
+        }
+    )
+    next_state["messages"] = messages
+
     next_state["interrupt_payload"] = {
-        "prompt": node.config.prompt,
+        "node_id": node.id,
+        "prompt": rendered_prompt,
         "expected_type": node.config.expected_type,
         "choices": node.config.choices,
     }
+
     return next_state
+
+
+def _stringify_interrupt_answer(answer: Any) -> str:
+    if isinstance(answer, str):
+        return answer
+    if answer is None:
+        return ""
+    try:
+        return json.dumps(answer, ensure_ascii=True)
+    except TypeError:
+        return str(answer)
 
 
 def _execute_llm_step(node: AgentNode, state: SubAgentState) -> SubAgentState:

@@ -5,6 +5,9 @@ __pycache__/
 .pytest_cache/
 .chroma/
 cents.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.log
 verify_startup.py
 test_runner.py

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import copy
-from typing import Any
+from collections.abc import Generator
+from typing import Any, cast
 import uuid
 
 import httpx
 import pytest
+from langchain_core.runnables import RunnableConfig
+from langgraph.types import Command
 
 from app.agents.compiler import (
     clear_compiled_agent_graph_cache,
@@ -16,17 +20,20 @@ from app.agents.compiler import (
     register_tool_executor,
 )
 from app.config import settings
+from app.graph.checkpointer import reset_checkpointer_connections
 from app.agents.template_schema import AgentTemplate
 from app.llm.client import LLMClientError
 
 
 @pytest.fixture(autouse=True)
-def reset_compiler_cache() -> None:
+def reset_compiler_cache() -> Generator[None, None, None]:
     clear_compiled_agent_graph_cache()
     clear_tool_executors()
+    asyncio.run(reset_checkpointer_connections())
     yield
     clear_compiled_agent_graph_cache()
     clear_tool_executors()
+    asyncio.run(reset_checkpointer_connections())
 
 
 @pytest.fixture(autouse=True)
@@ -945,3 +952,154 @@ def test_compiled_graph_cache_can_invalidate_all_versions_for_name(linear_templa
 
     assert rebuilt_v1 is not graph_v1
     assert rebuilt_v2 is not graph_v2
+
+
+def test_user_interrupt_pauses_and_emits_interrupt_payload(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    checkpoint_db = tmp_path / "interrupt-checkpoints.db"
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{checkpoint_db.as_posix()}",
+    )
+
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "ask_user",
+        "nodes": [
+            {
+                "id": "ask_user",
+                "type": "user_interrupt",
+                "config": {
+                    "prompt": "Confirm amount {{ parsed_data.amount }}?",
+                    "output_key": "user_confirmation",
+                    "expected_type": "confirmation",
+                },
+                "next": "respond",
+            },
+            {
+                "id": "respond",
+                "type": "terminal_response",
+                "config": {"template": "done"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+    compiled_graph = compile_agent_graph(template)
+
+    thread_id = f"interrupt-test:{uuid.uuid4()}"
+    config = cast(RunnableConfig, {"configurable": {"thread_id": thread_id}})
+    state = _base_state()
+    state["parsed_data"] = {"amount": 42}
+
+    interrupted_result = compiled_graph.invoke(state, config=config)
+
+    # On first interrupt, execution pauses before node return and preserves pre-interrupt state.
+    assert interrupted_result["parsed_data"]["amount"] == 42
+    assert "user_confirmation" not in interrupted_result["parsed_data"]
+
+    snapshot = compiled_graph.get_state(config)
+    assert snapshot.next == ("ask_user",)
+    assert snapshot.tasks
+    assert snapshot.tasks[0].interrupts
+    payload = snapshot.tasks[0].interrupts[0].value
+    assert payload["type"] == "user_interrupt"
+    assert payload["node_id"] == "ask_user"
+    assert payload["prompt"] == "Confirm amount 42?"
+
+
+def test_user_interrupt_resume_merges_answer_into_parsed_data_and_messages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    checkpoint_db = tmp_path / "interrupt-checkpoints.db"
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{checkpoint_db.as_posix()}",
+    )
+
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "ask_user",
+        "nodes": [
+            {
+                "id": "ask_user",
+                "type": "user_interrupt",
+                "config": {
+                    "prompt": "What category should I use?",
+                    "output_key": "category",
+                    "expected_type": "text",
+                },
+                "next": "respond",
+            },
+            {
+                "id": "respond",
+                "type": "terminal_response",
+                "config": {"template": "done"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+    compiled_graph = compile_agent_graph(template)
+
+    thread_id = f"interrupt-test:{uuid.uuid4()}"
+    config = cast(RunnableConfig, {"configurable": {"thread_id": thread_id}})
+    compiled_graph.invoke(_base_state(), config=config)
+
+    resumed_result = compiled_graph.invoke(Command(resume="groceries"), config=config)
+
+    assert resumed_result["parsed_data"]["category"] == "groceries"
+    assert resumed_result["messages"][-2] == {"role": "assistant", "content": "What category should I use?"}
+    assert resumed_result["messages"][-1] == {"role": "user", "content": "groceries"}
+    assert resumed_result["final_response"] == "done"
+
+
+def test_user_interrupt_resume_survives_checkpointer_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    checkpoint_db = tmp_path / "interrupt-checkpoints.db"
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{checkpoint_db.as_posix()}",
+    )
+
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "ask_user",
+        "nodes": [
+            {
+                "id": "ask_user",
+                "type": "user_interrupt",
+                "config": {
+                    "prompt": "Approve transfer?",
+                    "output_key": "approved",
+                    "expected_type": "confirmation",
+                },
+                "next": "respond",
+            },
+            {
+                "id": "respond",
+                "type": "terminal_response",
+                "config": {"template": "done"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    thread_id = f"interrupt-test:{uuid.uuid4()}"
+    config = cast(RunnableConfig, {"configurable": {"thread_id": thread_id}})
+
+    first_graph = compile_agent_graph(template)
+    first_graph.invoke(_base_state(), config=config)
+
+    # Simulate process restart by dropping checkpointer connections and recompiling.
+    asyncio.run(reset_checkpointer_connections())
+    second_graph = compile_agent_graph(template)
+
+    resumed_result = second_graph.invoke(Command(resume="yes"), config=config)
+
+    assert resumed_result["parsed_data"]["approved"] == "yes"
+    assert resumed_result["messages"][-1]["content"] == "yes"
+    assert resumed_result["final_response"] == "done"
