@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Annotated, Any
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.compiler import get_compiled_agent_graph, invalidate_compiled_agent_graph
+from app.agents.compiler import (
+    clear_runtime_event_emitter,
+    get_compiled_agent_graph,
+    invalidate_compiled_agent_graph,
+    set_runtime_event_emitter,
+)
 from app.agents.template_schema import validate_template
 from app.auth.users import current_active_user
 from app.config import settings
@@ -19,6 +26,8 @@ from app.db.base import get_async_session
 from app.db.models import AgentTemplate, PlatformConfig, User
 
 router = APIRouter()
+_RUN_REGISTRY_LOCK = threading.Lock()
+_RUN_REGISTRY: dict[str, dict[str, Any]] = {}
 
 
 class AgentTemplateCreateRequest(BaseModel):
@@ -66,6 +75,255 @@ class AgentResumeRequest(BaseModel):
     answer: Any
     thread_id: str = Field(min_length=1)
     version: int | None = Field(default=None, ge=1)
+
+
+class AgentRunStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input: str = Field(min_length=1)
+    version: int | None = Field(default=None, ge=1)
+    parsed_data: dict[str, Any] = Field(default_factory=dict)
+    service_results: dict[str, Any] = Field(default_factory=dict)
+    node_llm_configs: dict[str, dict[str, str | None]] = Field(default_factory=dict)
+
+
+class AgentRunResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answer: Any
+
+
+def _clear_agent_run_registry() -> None:
+    with _RUN_REGISTRY_LOCK:
+        _RUN_REGISTRY.clear()
+
+
+def _coerce_iteration_count(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed >= 0 else 0
+
+
+def _register_agent_run(
+    *,
+    run_id: str,
+    thread_id: str,
+    user_id: str,
+    agent_name: str,
+    version: int,
+) -> None:
+    with _RUN_REGISTRY_LOCK:
+        _RUN_REGISTRY[run_id] = {
+            "run_id": run_id,
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "agent_name": agent_name,
+            "version": version,
+            "status": "running",
+            "iteration_count": 0,
+            "final_response": "",
+            "error": None,
+        }
+
+
+def _update_agent_run(run_id: str, **changes: Any) -> None:
+    with _RUN_REGISTRY_LOCK:
+        record = _RUN_REGISTRY.get(run_id)
+        if record is None:
+            return
+        record.update(changes)
+
+
+def _get_agent_run_for_user(run_id: str, user_id: str) -> dict[str, Any] | None:
+    with _RUN_REGISTRY_LOCK:
+        record = _RUN_REGISTRY.get(run_id)
+        if record is None:
+            return None
+        if record.get("user_id") != user_id:
+            return None
+        return dict(record)
+
+
+def _build_run_state(
+    *,
+    payload: AgentRunStartRequest,
+    platform_guardrails: dict[str, Any],
+    template_guardrails: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "input": payload.input,
+        "parsed_data": dict(payload.parsed_data),
+        "messages": [{"role": "user", "content": payload.input}],
+        "iteration_count": 0,
+        "service_results": dict(payload.service_results),
+        "interrupt_payload": None,
+        "final_response": "",
+        "node_llm_configs": dict(payload.node_llm_configs),
+        "platform_guardrails": platform_guardrails,
+        "template_guardrails": template_guardrails,
+    }
+
+
+def _format_sse_data(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=True)}\n\n"
+
+
+def _queue_event(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue[dict[str, Any]], payload: dict[str, Any]) -> None:
+    loop.call_soon_threadsafe(queue.put_nowait, payload)
+
+
+def _build_run_id(user_id: str) -> str:
+    return f"{user_id}:{uuid.uuid4()}"
+
+
+async def _build_run_streaming_response(
+    *,
+    run_id: str,
+    thread_id: str,
+    compiled_graph,
+    invoke_input: dict[str, Any] | Command,
+    config: dict[str, Any],
+) -> StreamingResponse:
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    latest_node_id: dict[str, str | None] = {"value": None}
+
+    def _emit(event: dict[str, Any]) -> None:
+        event_name = str(event.get("event", "")).strip().lower()
+        if event_name == "node_started":
+            node_id = event.get("node_id")
+            latest_node_id["value"] = str(node_id) if node_id is not None else None
+        if event_name == "node_completed":
+            _update_agent_run(
+                run_id,
+                iteration_count=_coerce_iteration_count(event.get("iteration_count", 0)),
+            )
+
+        payload = {
+            "run_id": run_id,
+            "thread_id": thread_id,
+            **event,
+        }
+        _queue_event(loop, queue, payload)
+
+    def _invoke_graph() -> dict[str, Any]:
+        set_runtime_event_emitter(_emit)
+        try:
+            return compiled_graph.invoke(invoke_input, config)
+        finally:
+            clear_runtime_event_emitter()
+
+    async def _runner() -> None:
+        try:
+            result = await asyncio.to_thread(_invoke_graph)
+        except Exception as exc:
+            _update_agent_run(run_id, status="failed", error=str(exc))
+            _queue_event(
+                loop,
+                queue,
+                {
+                    "run_id": run_id,
+                    "thread_id": thread_id,
+                    "event": "error",
+                    "node_id": latest_node_id["value"],
+                    "message": str(exc),
+                },
+            )
+            _queue_event(
+                loop,
+                queue,
+                {
+                    "run_id": run_id,
+                    "thread_id": thread_id,
+                    "event": "done",
+                    "status": "failed",
+                },
+            )
+            return
+
+        iteration_count = _coerce_iteration_count(result.get("iteration_count", 0))
+        _update_agent_run(run_id, iteration_count=iteration_count)
+
+        interrupt_payload = _extract_first_interrupt_payload(compiled_graph, config)
+        if interrupt_payload is not None:
+            _update_agent_run(run_id, status="awaiting_input")
+            _queue_event(
+                loop,
+                queue,
+                {
+                    "run_id": run_id,
+                    "thread_id": thread_id,
+                    "event": "interrupt_requested",
+                    "node_id": interrupt_payload.get("node_id"),
+                    "prompt": str(interrupt_payload.get("prompt", "")),
+                },
+            )
+            _queue_event(
+                loop,
+                queue,
+                {
+                    "run_id": run_id,
+                    "thread_id": thread_id,
+                    "event": "done",
+                    "awaiting_input": True,
+                },
+            )
+            return
+
+        error_event = result.get("error_event")
+        if isinstance(error_event, dict):
+            error_message = str(error_event.get("message", error_event.get("type", "execution failed")))
+            _update_agent_run(run_id, status="failed", error=error_message)
+            _queue_event(
+                loop,
+                queue,
+                {
+                    "run_id": run_id,
+                    "thread_id": thread_id,
+                    "event": "error",
+                    "node_id": error_event.get("node_id"),
+                    "message": error_message,
+                },
+            )
+            _queue_event(
+                loop,
+                queue,
+                {
+                    "run_id": run_id,
+                    "thread_id": thread_id,
+                    "event": "done",
+                    "status": "failed",
+                },
+            )
+            return
+
+        final_response = str(result.get("final_response", ""))
+        _update_agent_run(run_id, status="succeeded", final_response=final_response)
+        _queue_event(
+            loop,
+            queue,
+            {
+                "run_id": run_id,
+                "thread_id": thread_id,
+                "event": "done",
+                "final_response": final_response,
+            },
+        )
+
+    worker = asyncio.create_task(_runner())
+
+    async def _event_stream():
+        while True:
+            payload = await queue.get()
+            yield _format_sse_data(payload)
+            if payload.get("event") == "done":
+                break
+        if not worker.done():
+            await worker
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")
 
 
 def _parse_json(value: str | None) -> Any:
@@ -142,7 +400,11 @@ async def _get_versions_for_name(session: AsyncSession, name: str) -> list[Agent
 
 
 def _extract_first_interrupt_payload(compiled_graph, config: dict[str, Any]) -> dict[str, Any] | None:
-    snapshot = compiled_graph.get_state(config)
+    try:
+        snapshot = compiled_graph.get_state(config)
+    except ValueError:
+        return None
+
     for task in getattr(snapshot, "tasks", ()):
         interrupts = getattr(task, "interrupts", ())
         if not interrupts:
@@ -404,6 +666,143 @@ async def get_latest_agent(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent template not found")
 
     return _serialize_record(latest)
+
+
+@router.post("/{name}/runs")
+async def start_agent_run(
+    name: str,
+    payload: AgentRunStartRequest,
+    user: Annotated[User, Depends(current_active_user)],
+    session: AsyncSession = Depends(get_async_session),
+):
+    normalized_name = name.strip()
+    record, raw_template = await _resolve_runnable_template(
+        session,
+        name=normalized_name,
+        requested_version=payload.version,
+    )
+    parsed = validate_template(raw_template)
+    if parsed.template is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Stored template failed validation.",
+        )
+
+    user_id = str(user.id)
+    run_id = _build_run_id(user_id)
+    thread_id = run_id
+
+    _register_agent_run(
+        run_id=run_id,
+        thread_id=thread_id,
+        user_id=user_id,
+        agent_name=normalized_name,
+        version=record.version,
+    )
+
+    platform_guardrails = await _build_platform_guardrails(session)
+    template_guardrails = _build_template_guardrails(raw_template)
+    state = _build_run_state(
+        payload=payload,
+        platform_guardrails=platform_guardrails,
+        template_guardrails=template_guardrails,
+    )
+
+    config = {"configurable": {"thread_id": thread_id}}
+    compiled_graph = get_compiled_agent_graph(
+        name=normalized_name,
+        version=record.version,
+        template=parsed.template,
+    )
+
+    return await _build_run_streaming_response(
+        run_id=run_id,
+        thread_id=thread_id,
+        compiled_graph=compiled_graph,
+        invoke_input=state,
+        config=config,
+    )
+
+
+@router.post("/runs/{run_id}/resume")
+async def resume_agent_run(
+    run_id: str,
+    payload: AgentRunResumeRequest,
+    user: Annotated[User, Depends(current_active_user)],
+    session: AsyncSession = Depends(get_async_session),
+):
+    user_id = str(user.id)
+    run_record = _get_agent_run_for_user(run_id, user_id)
+    if run_record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+
+    if run_record.get("status") != "awaiting_input":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Run is not awaiting input.",
+        )
+
+    agent_name = str(run_record.get("agent_name", "")).strip()
+    requested_version = _coerce_iteration_count(run_record.get("version", 0))
+    if not agent_name or requested_version < 1:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Run metadata is invalid.",
+        )
+
+    record, raw_template = await _resolve_runnable_template(
+        session,
+        name=agent_name,
+        requested_version=requested_version,
+    )
+    parsed = validate_template(raw_template)
+    if parsed.template is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Stored template failed validation.",
+        )
+
+    thread_id = str(run_record.get("thread_id", "")).strip()
+    if not thread_id:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Run thread_id is missing.",
+        )
+
+    _update_agent_run(run_id, status="running", error=None, final_response="")
+
+    config = {"configurable": {"thread_id": thread_id}}
+    compiled_graph = get_compiled_agent_graph(
+        name=agent_name,
+        version=record.version,
+        template=parsed.template,
+    )
+
+    return await _build_run_streaming_response(
+        run_id=run_id,
+        thread_id=thread_id,
+        compiled_graph=compiled_graph,
+        invoke_input=Command(resume=payload.answer),
+        config=config,
+    )
+
+
+@router.get("/runs/{run_id}", response_model=dict)
+async def get_agent_run(
+    run_id: str,
+    user: Annotated[User, Depends(current_active_user)],
+):
+    user_id = str(user.id)
+    run_record = _get_agent_run_for_user(run_id, user_id)
+    if run_record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+
+    return {
+        "run_id": run_record["run_id"],
+        "thread_id": run_record["thread_id"],
+        "status": run_record["status"],
+        "iteration_count": _coerce_iteration_count(run_record.get("iteration_count", 0)),
+    }
 
 
 @router.post("/{name}/run", response_model=dict)

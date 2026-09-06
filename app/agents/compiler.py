@@ -5,6 +5,7 @@ import ast
 import json
 import re
 import threading
+import time
 import uuid
 from urllib.parse import urlparse
 from collections.abc import Callable
@@ -38,6 +39,7 @@ from app.llm.client import LLMClientError, generate_text
 
 NodeExecutor = Callable[[AgentNode, SubAgentState], SubAgentState]
 ToolExecutor = Callable[[dict[str, Any], SubAgentState], Any]
+RuntimeEventEmitter = Callable[[dict[str, Any]], None]
 CompiledGraphCacheKey = tuple[str, int]
 
 _HALT_ROUTE_KEY = "__halt__"
@@ -46,6 +48,22 @@ _GUARDRAIL_HALT_NODE_ID = "__guardrail_halt__"
 _COMPILED_GRAPH_CACHE: dict[CompiledGraphCacheKey, CompiledStateGraph] = {}
 _TOOL_EXECUTORS_BY_ID: dict[str, ToolExecutor] = {}
 _TOOL_EXECUTORS_BY_NAME: dict[str, ToolExecutor] = {}
+_RUNTIME_EVENT_CONTEXT = threading.local()
+
+
+def set_runtime_event_emitter(emitter: RuntimeEventEmitter | None) -> None:
+    _RUNTIME_EVENT_CONTEXT.emitter = emitter
+
+
+def clear_runtime_event_emitter() -> None:
+    if hasattr(_RUNTIME_EVENT_CONTEXT, "emitter"):
+        delattr(_RUNTIME_EVENT_CONTEXT, "emitter")
+
+
+def _emit_runtime_event(event: dict[str, Any]) -> None:
+    emitter = getattr(_RUNTIME_EVENT_CONTEXT, "emitter", None)
+    if callable(emitter):
+        emitter(event)
 
 
 def compile_agent_graph(template: AgentTemplate) -> CompiledStateGraph:
@@ -181,14 +199,65 @@ def _build_node_handler(node: AgentNode, template: AgentTemplate) -> Callable[[S
         if _should_halt_execution(state_with_guardrails):
             return state_with_guardrails
 
+        started_at = time.perf_counter()
+        _emit_runtime_event(
+            {
+                "event": "node_started",
+                "node_id": node.id,
+                "type": node.type,
+            }
+        )
+
         if _has_reached_iteration_limit(state_with_guardrails):
-            return _mark_iteration_limit_exceeded(state_with_guardrails, node.id)
+            failed_state = _mark_iteration_limit_exceeded(state_with_guardrails, node.id)
+            error_event = failed_state.get("error_event")
+            if isinstance(error_event, dict):
+                _emit_runtime_event(
+                    {
+                        "event": "error",
+                        "node_id": str(error_event.get("node_id", node.id)),
+                        "message": str(error_event.get("message", "iteration limit exceeded")),
+                    }
+                )
+            return failed_state
 
         next_state = _touch_iteration(state_with_guardrails, node.id)
         if _should_halt_execution(next_state):
             return next_state
 
-        return executor(node, next_state)
+        try:
+            result = executor(node, next_state)
+        except Exception as exc:
+            _emit_runtime_event(
+                {
+                    "event": "error",
+                    "node_id": node.id,
+                    "message": str(exc),
+                }
+            )
+            raise
+
+        duration_ms = max(0, int((time.perf_counter() - started_at) * 1000))
+        _emit_runtime_event(
+            {
+                "event": "node_completed",
+                "node_id": node.id,
+                "duration": duration_ms,
+                "iteration_count": _coerce_int(result.get("iteration_count", 0), fallback=0),
+            }
+        )
+
+        error_event = result.get("error_event")
+        if isinstance(error_event, dict):
+            _emit_runtime_event(
+                {
+                    "event": "error",
+                    "node_id": str(error_event.get("node_id", node.id)),
+                    "message": str(error_event.get("message", error_event.get("type", "execution failed"))),
+                }
+            )
+
+        return result
 
     return _handler
 
