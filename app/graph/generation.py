@@ -1,6 +1,7 @@
 from app.config import settings
 from app.graph.state import GraphState
 from app.llm.client import LLMClientError, generate_text
+from app.services.metrics import record_metric_event
 
 
 def _build_context(retrieved_docs: list[dict], retrieved_tools: list[dict]) -> str:
@@ -79,6 +80,14 @@ async def generation_node(state: GraphState) -> GraphState:
         payload = await generate_text(request_payload)
     except LLMClientError as exc:
         raise RuntimeError(str(exc)) from exc
+
+    await record_metric_event(
+        conversation_id=state.get("conversation_id"),
+        node_key="generation",
+        model=str(payload.get("model") or selected_model or model_type),
+        latency_ms=payload.get("latency_ms"),
+        usage=payload.get("usage"),
+    )
 
     generated_text = str(payload.get("text", "")).strip()
     if not generated_text:

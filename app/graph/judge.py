@@ -3,6 +3,7 @@ import json
 from app.config import settings
 from app.graph.state import GraphState
 from app.llm.client import LLMClientError, generate_text
+from app.services.metrics import record_metric_event
 
 
 def _heuristic_verdict(generated_response: str) -> tuple[str, str]:
@@ -35,7 +36,7 @@ def _resolve_judge_model_config(state: GraphState) -> tuple[str, str | None]:
     return model_type, (model or None)
 
 
-async def _llm_judge_verdict(state: GraphState) -> tuple[str, str]:
+async def _llm_judge_verdict(state: GraphState) -> tuple[str, str, dict]:
     generated_response = state.get("generated_response", "")
     retrieved_docs = state.get("retrieved_docs", [])
     retrieved_tools = state.get("retrieved_tools", [])
@@ -72,7 +73,7 @@ async def _llm_judge_verdict(state: GraphState) -> tuple[str, str]:
     response = await generate_text(payload)
     raw_text = str(response.get("text", "")).strip()
     if not raw_text:
-        return "fail", "Judge model returned an empty verdict."
+        return "fail", "Judge model returned an empty verdict.", response
 
     try:
         parsed = json.loads(raw_text)
@@ -80,14 +81,14 @@ async def _llm_judge_verdict(state: GraphState) -> tuple[str, str]:
             verdict = str(parsed.get("verdict", "")).strip().lower()
             reason = str(parsed.get("reason", "")).strip() or "Judge model did not include a reason."
             if verdict in {"pass", "fail"}:
-                return verdict, reason
+                return verdict, reason, response
     except json.JSONDecodeError:
         pass
 
     lowered = raw_text.lower()
     if "fail" in lowered and "pass" not in lowered:
-        return "fail", "Judge model marked response as failed."
-    return "pass", "Judge model marked response as acceptable."
+        return "fail", "Judge model marked response as failed.", response
+    return "pass", "Judge model marked response as acceptable.", response
 
 
 async def judge_node(state: GraphState) -> GraphState:
@@ -97,11 +98,26 @@ async def judge_node(state: GraphState) -> GraphState:
     verdict, reason = _heuristic_verdict(generated_response)
 
     if settings.llm_judge_enabled and generated_response.strip():
+        model_type, selected_model = _resolve_judge_model_config(state)
         try:
-            verdict, reason = await _llm_judge_verdict(state)
+            verdict, reason, response = await _llm_judge_verdict(state)
+            await record_metric_event(
+                conversation_id=state.get("conversation_id"),
+                node_key="judge",
+                model=str(response.get("model") or selected_model or model_type),
+                latency_ms=response.get("latency_ms"),
+                usage=response.get("usage"),
+                judge_verdict=verdict,
+            )
         except LLMClientError as exc:
             verdict = "fail"
             reason = f"Judge model request failed: {exc}"
+            await record_metric_event(
+                conversation_id=state.get("conversation_id"),
+                node_key="judge",
+                model=selected_model or model_type,
+                judge_verdict=verdict,
+            )
 
     state["judge_verdict"] = {"verdict": verdict, "reason": reason}
     state["retry_count"] = retry_count + 1 if verdict == "fail" else retry_count

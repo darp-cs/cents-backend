@@ -1,9 +1,13 @@
+import time
+
 from app.config import settings
 from app.graph.state import GraphState
+from app.services.metrics import record_metric_event
 from app.vector_store import query_documents
 
 
-def document_retrieval_node(state: GraphState) -> GraphState:
+async def document_retrieval_node(state: GraphState) -> GraphState:
+    started_at = time.perf_counter()
     query_text = ""
     for message in state.get("messages", []):
         if message.get("role") == "user":
@@ -23,4 +27,10 @@ def document_retrieval_node(state: GraphState) -> GraphState:
         }
         for item in docs
     ]
+    await record_metric_event(
+        conversation_id=state.get("conversation_id"),
+        node_key="retrieved_docs",
+        latency_ms=(time.perf_counter() - started_at) * 1000,
+        retrieved_count=len(docs),
+    )
     return state
