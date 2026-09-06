@@ -17,6 +17,7 @@ from app.agents.compiler import (
 )
 from app.config import settings
 from app.agents.template_schema import AgentTemplate
+from app.llm.client import LLMClientError
 
 
 @pytest.fixture(autouse=True)
@@ -247,6 +248,196 @@ def test_structured_parser_without_on_failure_raises_clear_error(
         compiled_graph.invoke(_base_state())
 
     assert "Structured parser node 'parse' failed" in str(exc.value)
+
+
+def test_llm_step_calls_llm_service_and_persists_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "draft_reply",
+        "nodes": [
+            {
+                "id": "draft_reply",
+                "type": "llm_step",
+                "config": {
+                    "model_type": "text-generation",
+                    "model": "tiny-model",
+                    "system_prompt": (
+                        "Classify amount {{ parsed_data.amount }} with service status "
+                        "{{ service_results.lookup.body.status }}"
+                    ),
+                    "temperature": 0.1,
+                    "max_tokens": 48,
+                    "output_key": "classification",
+                },
+                "next": "respond",
+            },
+            {
+                "id": "respond",
+                "type": "terminal_response",
+                "config": {"template": "done"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    captured_payload: dict[str, Any] = {}
+
+    async def _fake_generate_text(payload: dict[str, Any]) -> dict[str, Any]:
+        captured_payload.update(payload)
+        return {"text": "expense"}
+
+    monkeypatch.setattr("app.agents.compiler.generate_text", _fake_generate_text)
+
+    state = _base_state()
+    state["messages"] = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "second"},
+    ]
+    state["parsed_data"] = {"amount": 95}
+    state["service_results"] = {"lookup": {"body": {"status": "approved"}}}
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(state)
+
+    assert captured_payload["model_folder"] == "text-generation"
+    assert captured_payload["model"] == "tiny-model"
+    assert captured_payload["temperature"] == 0.1
+    assert captured_payload["max_tokens"] == 48
+    assert captured_payload["system_prompt"] == "Classify amount 95 with service status approved"
+    assert captured_payload["messages"] == [
+        {
+            "role": "user",
+            "content": "Complete exactly the task described by the system prompt.",
+        }
+    ]
+    assert result["messages"][-1] == {"role": "assistant", "content": "expense"}
+    assert result["parsed_data"]["classification"] == "expense"
+
+
+def test_llm_step_without_output_key_only_appends_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "draft_reply",
+        "nodes": [
+            {
+                "id": "draft_reply",
+                "type": "llm_step",
+                "config": {
+                    "model_type": "text-generation",
+                    "system_prompt": "Summarize {{ parsed_data.topic }}",
+                    "temperature": 0.1,
+                    "max_tokens": 48,
+                },
+                "next": "respond",
+            },
+            {
+                "id": "respond",
+                "type": "terminal_response",
+                "config": {"template": "done"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    async def _fake_generate_text(_: dict[str, Any]) -> dict[str, Any]:
+        return {"text": "summary"}
+
+    monkeypatch.setattr("app.agents.compiler.generate_text", _fake_generate_text)
+
+    state = _base_state()
+    state["parsed_data"] = {"topic": "groceries"}
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(state)
+
+    assert result["messages"][-1] == {"role": "assistant", "content": "summary"}
+    assert "classification" not in result["parsed_data"]
+
+
+def test_llm_step_llm_client_error_routes_to_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "draft_reply",
+        "nodes": [
+            {
+                "id": "draft_reply",
+                "type": "llm_step",
+                "config": {
+                    "model_type": "text-generation",
+                    "system_prompt": "Summarize {{ parsed_data.topic }}",
+                    "temperature": 0.1,
+                    "max_tokens": 48,
+                },
+                "next": "success_response",
+                "on_failure": "failure_response",
+            },
+            {
+                "id": "success_response",
+                "type": "terminal_response",
+                "config": {"template": "success"},
+            },
+            {
+                "id": "failure_response",
+                "type": "terminal_response",
+                "config": {"template": "failure"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    async def _fake_generate_text(_: dict[str, Any]) -> dict[str, Any]:
+        raise LLMClientError("down")
+
+    monkeypatch.setattr("app.agents.compiler.generate_text", _fake_generate_text)
+
+    state = _base_state()
+    state["parsed_data"] = {"topic": "groceries"}
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(state)
+
+    assert result["final_response"] == "failure"
+    assert result["parsed_data"]["__llm_step_status__"]["draft_reply"] == "failure"
+    assert result["parsed_data"]["__llm_step_errors__"]["draft_reply"] == "down"
+
+
+def test_llm_step_llm_client_error_without_on_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "draft_reply",
+        "nodes": [
+            {
+                "id": "draft_reply",
+                "type": "llm_step",
+                "config": {
+                    "model_type": "text-generation",
+                    "system_prompt": "Summarize {{ parsed_data.topic }}",
+                    "temperature": 0.1,
+                    "max_tokens": 48,
+                },
+                "next": "success_response",
+            },
+            {
+                "id": "success_response",
+                "type": "terminal_response",
+                "config": {"template": "success"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    async def _fake_generate_text(_: dict[str, Any]) -> dict[str, Any]:
+        raise LLMClientError("down")
+
+    monkeypatch.setattr("app.agents.compiler.generate_text", _fake_generate_text)
+
+    compiled_graph = compile_agent_graph(template)
+    state = _base_state()
+    state["parsed_data"] = {"topic": "groceries"}
+    with pytest.raises(RuntimeError) as exc:
+        compiled_graph.invoke(state)
+
+    assert "LLM step node 'draft_reply' failed: down" in str(exc.value)
 
 
 def test_service_call_non_2xx_routes_to_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:

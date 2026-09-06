@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import re
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -77,13 +78,32 @@ class UserInterruptConfig(_StrictModel):
 class LLMStepConfig(_StrictModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
-    prompt_template: str = Field(min_length=1)
-    output_key: str = Field(min_length=1)
-    system_prompt: str | None = None
-    model_type: str = "text-generation"
+    model_type: str = Field(min_length=1)
     model: str | None = None
-    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
-    max_tokens: int | None = Field(default=None, ge=1, le=4096)
+    system_prompt: str = Field(min_length=1)
+    max_tokens: int = Field(ge=1, le=4096)
+    temperature: float = Field(ge=0.0, le=2.0)
+    output_key: str | None = Field(default=None, min_length=1)
+
+    @field_validator("system_prompt")
+    @classmethod
+    def validate_system_prompt_references(cls, value: str) -> str:
+        pattern = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+        for match in pattern.finditer(value):
+            reference = match.group(1).strip()
+            if reference.startswith("state."):
+                reference = reference[len("state.") :]
+
+            if reference == "parsed_data" or reference.startswith("parsed_data."):
+                continue
+            if reference == "service_results" or reference.startswith("service_results."):
+                continue
+
+            raise ValueError(
+                "llm_step system_prompt placeholders must reference "
+                "parsed_data.* or service_results.*"
+            )
+        return value
 
 
 class TerminalResponseConfig(_StrictModel):
@@ -134,6 +154,7 @@ class LLMStepNode(_BaseNode):
     type: Literal["llm_step"]
     config: LLMStepConfig
     next: str = Field(pattern=NODE_ID_PATTERN)
+    on_failure: str | None = Field(default=None, pattern=NODE_ID_PATTERN)
 
 
 class TerminalResponseNode(_BaseNode):
@@ -208,6 +229,8 @@ def _outgoing_edges(node: AgentNode) -> list[tuple[str, str]]:
     if isinstance(node, ServiceCallNode) and node.on_failure:
         return [("next", node.next), ("on_failure", node.on_failure)]
     if isinstance(node, StructuredParserNode) and node.on_failure:
+        return [("next", node.next), ("on_failure", node.on_failure)]
+    if isinstance(node, LLMStepNode) and node.on_failure:
         return [("next", node.next), ("on_failure", node.on_failure)]
     return [("next", node.next)]
 
