@@ -149,6 +149,8 @@ Use `validate_template(raw_json)` to parse and validate templates. It checks:
 - `structured_parser` supports deterministic extraction (`regex`/keyword) and LLM extraction (`llm`).
 - Parser output is merged into `parsed_data` by field name so multiple parser nodes can contribute fields.
 - Parser failures route to `on_failure` when configured, otherwise the run raises a clear parser error.
+- `terminal_response` renders its template using `parsed_data`, `messages`, and `service_results`, then writes the rendered text to `final_response`.
+- `terminal_response` is an explicit terminal node and always routes to `END` (distinct from interrupt and error paths).
 - `user_interrupt` renders a prompt template from current state and pauses execution using LangGraph interrupts.
 - Interrupt-capable templates are compiled with a persistent SQLite checkpointer based on `DATABASE_URL`, so pause state survives process restarts when resumed with the same `thread_id`.
 - Resuming with `Command(resume=<answer>)` continues from the interrupted node's `next` and merges the answer into `parsed_data[output_key]` plus `messages`.

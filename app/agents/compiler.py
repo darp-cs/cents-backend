@@ -1243,8 +1243,70 @@ def _resolve_llm_step_reference(reference: str, state: SubAgentState) -> Any:
 def _execute_terminal_response(node: AgentNode, state: SubAgentState) -> SubAgentState:
     assert isinstance(node, TerminalResponseNode)
     next_state = _touch_iteration(state)
-    next_state["final_response"] = node.config.template
+    next_state["final_response"] = _render_terminal_response_template(node.config.template, next_state)
     return next_state
+
+
+def _render_terminal_response_template(template: str, state: SubAgentState) -> str:
+    pattern = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+    matches = list(pattern.finditer(template))
+    if not matches:
+        return template
+
+    if len(matches) == 1 and matches[0].span() == (0, len(template)):
+        resolved = _resolve_terminal_response_reference(matches[0].group(1), state)
+        return _render_terminal_response_value(resolved)
+
+    rendered = template
+    for match in matches:
+        placeholder = match.group(0)
+        resolved = _resolve_terminal_response_reference(match.group(1), state)
+        rendered = rendered.replace(placeholder, _render_terminal_response_value(resolved))
+    return rendered
+
+
+def _resolve_terminal_response_reference(reference: str, state: SubAgentState) -> Any:
+    path = reference.strip()
+    if path.startswith("state."):
+        path = path[len("state.") :]
+
+    parsed_data = state.get("parsed_data", {})
+    if isinstance(parsed_data, dict) and path in parsed_data:
+        return parsed_data[path]
+
+    if not (
+        path == "parsed_data"
+        or path.startswith("parsed_data.")
+        or path == "messages"
+        or path.startswith("messages.")
+        or path == "service_results"
+        or path.startswith("service_results.")
+    ):
+        raise RuntimeError(
+            "terminal_response template placeholders may only reference "
+            "parsed_data.*, messages.*, or service_results.*"
+        )
+
+    scoped_state = cast(
+        SubAgentState,
+        {
+            "parsed_data": state.get("parsed_data", {}),
+            "messages": state.get("messages", []),
+            "service_results": state.get("service_results", {}),
+        },
+    )
+    return _resolve_state_reference(scoped_state, path)
+
+
+def _render_terminal_response_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=True)
+    except TypeError:
+        return str(value)
 
 
 _NODE_EXECUTORS: dict[str, NodeExecutor] = {
