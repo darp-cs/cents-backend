@@ -64,10 +64,10 @@ def valid_template() -> dict:
                 "id": "call_ledger",
                 "type": "service_call",
                 "config": {
-                    "service": "ledger",
-                    "operation": "record_transaction",
-                    "parameters": {"amount": "{{ parsed_request.amount }}"},
-                    "output_key": "ledger_result",
+                    "mode": "http",
+                    "url": "http://localhost/ledger",
+                    "method": "POST",
+                    "body_template": {"amount": "{{ parsed_data.amount }}"},
                 },
                 "next": "summarize",
             },
@@ -150,6 +150,18 @@ def test_dangling_on_failure_target_is_rejected(valid_template: dict) -> None:
     assert not result.is_valid
     assert result.errors == [
         "Node 'parse_request' on_failure points to unknown node id 'missing_fallback'."
+    ]
+
+
+def test_dangling_service_call_on_failure_target_is_rejected(valid_template: dict) -> None:
+    template = copy.deepcopy(valid_template)
+    template["nodes"][3]["on_failure"] = "missing_service_fallback"
+
+    result = validate_template(template)
+
+    assert not result.is_valid
+    assert result.errors == [
+        "Node 'call_ledger' on_failure points to unknown node id 'missing_service_fallback'."
     ]
 
 
@@ -293,3 +305,28 @@ def test_non_dict_input_is_rejected() -> None:
     result = validate_template("{}")  # type: ignore[arg-type]
 
     assert result.errors == ["Template must be a JSON object."]
+
+
+def test_service_call_http_requires_url(valid_template: dict) -> None:
+    template = copy.deepcopy(valid_template)
+    template["nodes"][3]["config"] = {
+        "mode": "http",
+        "method": "GET",
+    }
+
+    result = validate_template(template)
+
+    assert not result.is_valid
+    assert any("mode='http' requires a non-empty url" in error for error in result.errors)
+
+
+def test_service_call_tool_requires_name_or_id(valid_template: dict) -> None:
+    template = copy.deepcopy(valid_template)
+    template["nodes"][3]["config"] = {
+        "mode": "tool",
+    }
+
+    result = validate_template(template)
+
+    assert not result.is_valid
+    assert any("mode='tool' requires tool_name or tool_id" in error for error in result.errors)

@@ -5,11 +5,15 @@ import ast
 import json
 import re
 import threading
+import uuid
+from urllib.parse import urlparse
 from collections.abc import Callable
 from typing import Any, Hashable, cast
 
+import httpx
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from sqlalchemy import select
 
 from app.agents.state import SubAgentState
 from app.agents.template_schema import (
@@ -18,6 +22,7 @@ from app.agents.template_schema import (
     ConditionNode,
     LLMStepNode,
     ParsedField,
+    ServiceCallConfig,
     ServiceCallNode,
     StructuredParserConfig,
     StructuredParserNode,
@@ -25,12 +30,17 @@ from app.agents.template_schema import (
     UserInterruptNode,
 )
 from app.config import settings
+from app.db.base import AsyncSessionLocal
+from app.db.models import ToolDefinition
 from app.llm.client import LLMClientError, generate_text
 
 NodeExecutor = Callable[[AgentNode, SubAgentState], SubAgentState]
+ToolExecutor = Callable[[dict[str, Any], SubAgentState], Any]
 CompiledGraphCacheKey = tuple[str, int]
 
 _COMPILED_GRAPH_CACHE: dict[CompiledGraphCacheKey, CompiledStateGraph] = {}
+_TOOL_EXECUTORS_BY_ID: dict[str, ToolExecutor] = {}
+_TOOL_EXECUTORS_BY_NAME: dict[str, ToolExecutor] = {}
 
 
 def compile_agent_graph(template: AgentTemplate) -> CompiledStateGraph:
@@ -54,6 +64,17 @@ def compile_agent_graph(template: AgentTemplate) -> CompiledStateGraph:
             workflow.add_conditional_edges(
                 node.id,
                 _build_structured_parser_router(node),
+                {
+                    "success": node.next,
+                    "failure": node.on_failure,
+                },
+            )
+            continue
+
+        if isinstance(node, ServiceCallNode) and node.on_failure:
+            workflow.add_conditional_edges(
+                node.id,
+                _build_service_call_router(node.id),
                 {
                     "success": node.next,
                     "failure": node.on_failure,
@@ -96,6 +117,26 @@ def clear_compiled_agent_graph_cache() -> None:
     _COMPILED_GRAPH_CACHE.clear()
 
 
+def register_tool_executor(
+    *,
+    tool_name: str | None = None,
+    tool_id: str | None = None,
+    executor: ToolExecutor,
+) -> None:
+    if not tool_name and not tool_id:
+        raise ValueError("register_tool_executor requires tool_name or tool_id.")
+
+    if tool_name:
+        _TOOL_EXECUTORS_BY_NAME[tool_name.strip()] = executor
+    if tool_id:
+        _TOOL_EXECUTORS_BY_ID[tool_id.strip()] = executor
+
+
+def clear_tool_executors() -> None:
+    _TOOL_EXECUTORS_BY_ID.clear()
+    _TOOL_EXECUTORS_BY_NAME.clear()
+
+
 def _build_node_handler(node: AgentNode) -> Callable[[SubAgentState], SubAgentState]:
     executor = _NODE_EXECUTORS[node.type]
 
@@ -119,6 +160,13 @@ def _build_structured_parser_router(node: StructuredParserNode) -> Callable[[Sub
     return _router
 
 
+def _build_service_call_router(node_id: str) -> Callable[[SubAgentState], str]:
+    def _router(state: SubAgentState) -> str:
+        return _resolve_service_call_route(node_id, state)
+
+    return _router
+
+
 def _resolve_condition_route(node: ConditionNode, state: SubAgentState) -> str:
     parsed_data = state.get("parsed_data", {})
     if isinstance(parsed_data, dict):
@@ -136,6 +184,15 @@ def _resolve_structured_parser_route(node_id: str, state: SubAgentState) -> str:
     if isinstance(parsed_data, dict):
         parser_status = parsed_data.get("__parser_status__", {})
         if isinstance(parser_status, dict) and parser_status.get(node_id) == "failure":
+            return "failure"
+    return "success"
+
+
+def _resolve_service_call_route(node_id: str, state: SubAgentState) -> str:
+    service_results = state.get("service_results", {})
+    if isinstance(service_results, dict):
+        node_result = service_results.get(node_id)
+        if isinstance(node_result, dict) and node_result.get("__status__") == "failure":
             return "failure"
     return "success"
 
@@ -667,14 +724,300 @@ def _execute_condition(node: AgentNode, state: SubAgentState) -> SubAgentState:
 def _execute_service_call(node: AgentNode, state: SubAgentState) -> SubAgentState:
     assert isinstance(node, ServiceCallNode)
     next_state = _touch_iteration(state)
+    try:
+        response_payload = _execute_service_call_request(node.config, next_state)
+    except RuntimeError as exc:
+        return _handle_service_call_failure(node=node, state=next_state, message=str(exc))
+
     service_results = dict(next_state.get("service_results", {}))
     service_results[node.id] = {
-        "service": node.config.service,
-        "operation": node.config.operation,
-        "status": "stubbed",
+        "__status__": "success",
+        **response_payload,
     }
     next_state["service_results"] = service_results
     return next_state
+
+
+def _handle_service_call_failure(
+    node: ServiceCallNode,
+    state: SubAgentState,
+    message: str,
+) -> SubAgentState:
+    if node.on_failure is None:
+        raise RuntimeError(f"Service call node '{node.id}' failed: {message}")
+
+    service_results = dict(state.get("service_results", {}))
+    service_results[node.id] = {
+        "__status__": "failure",
+        "error": message,
+    }
+
+    next_state = cast(SubAgentState, dict(state))
+    next_state["service_results"] = service_results
+    return next_state
+
+
+def _execute_service_call_request(config: ServiceCallConfig, state: SubAgentState) -> dict[str, Any]:
+    if config.mode == "tool":
+        return _execute_tool_service_call(config, state)
+    return _execute_http_service_call(config, state)
+
+
+def _execute_http_service_call(config: ServiceCallConfig, state: SubAgentState) -> dict[str, Any]:
+    if config.url is None:
+        raise RuntimeError("service_call mode='http' requires a url.")
+
+    rendered_url = str(_render_template_value(config.url, state)).strip()
+    _assert_destination_allowed(rendered_url, config.allow_unsafe_destination)
+
+    headers = _render_http_headers(config.headers_template, state)
+    if config.body_template is not None:
+        _enforce_secret_reference_for_sensitive_body(config.body_template)
+    body = _render_template_value(config.body_template, state) if config.body_template is not None else None
+    timeout = config.timeout_seconds or settings.service_call_default_timeout_seconds
+
+    try:
+        response = httpx.request(
+            method=config.method,
+            url=rendered_url,
+            headers=headers,
+            json=body,
+            timeout=timeout,
+            follow_redirects=False,
+        )
+    except httpx.TimeoutException as exc:
+        raise RuntimeError("HTTP service call timed out.") from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"HTTP service call failed: {exc}") from exc
+
+    if response.status_code < 200 or response.status_code >= 300:
+        raise RuntimeError(
+            f"HTTP service call returned non-2xx status {response.status_code}: {response.text.strip()}"
+        )
+
+    payload: Any
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = response.text
+
+    return {
+        "mode": "http",
+        "url": rendered_url,
+        "method": config.method,
+        "status_code": response.status_code,
+        "body": payload,
+    }
+
+
+def _assert_destination_allowed(url: str, allow_unsafe_destination: bool) -> None:
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise RuntimeError("Only http/https URLs are allowed for service_call http mode.")
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise RuntimeError("service_call url must include a hostname.")
+
+    allowed_hosts = {host.lower() for host in settings.service_call_allowed_hosts}
+    if hostname in allowed_hosts:
+        return
+
+    if allow_unsafe_destination and settings.service_call_allow_unsafe_destinations:
+        return
+
+    raise RuntimeError(
+        f"Destination host '{hostname}' is not in service_call_allowed_hosts. "
+        "Use server-side opt-in to allow unsafe destinations."
+    )
+
+
+def _render_http_headers(headers_template: dict[str, str], state: SubAgentState) -> dict[str, str]:
+    rendered: dict[str, str] = {}
+    for raw_name, raw_value in headers_template.items():
+        header_name = str(raw_name).strip()
+        if not header_name:
+            continue
+
+        template_value = str(raw_value)
+        _enforce_secret_reference_for_sensitive_header(header_name, template_value)
+        rendered_value = _render_template_value(template_value, state)
+        rendered[header_name] = str(rendered_value)
+    return rendered
+
+
+def _enforce_secret_reference_for_sensitive_header(header_name: str, template_value: str) -> None:
+    sensitive_headers = {"authorization", "x-api-key", "api-key", "x-auth-token"}
+    if header_name.strip().lower() not in sensitive_headers:
+        return
+
+    if "{{ secret." not in template_value and "{{ secrets." not in template_value:
+        raise RuntimeError(
+            f"Sensitive header '{header_name}' must use a server-side secret reference placeholder."
+        )
+
+
+def _enforce_secret_reference_for_sensitive_body(template_value: Any, path: str = "") -> None:
+    sensitive_keys = {"api_key", "apikey", "token", "secret", "password"}
+
+    if isinstance(template_value, dict):
+        for key, value in template_value.items():
+            key_name = str(key).strip()
+            next_path = f"{path}.{key_name}" if path else key_name
+            if key_name.lower() in sensitive_keys and isinstance(value, str):
+                if "{{ secret." not in value and "{{ secrets." not in value:
+                    raise RuntimeError(
+                        f"Sensitive body field '{next_path}' must use a server-side secret placeholder."
+                    )
+            _enforce_secret_reference_for_sensitive_body(value, next_path)
+        return
+
+    if isinstance(template_value, list):
+        for index, item in enumerate(template_value):
+            _enforce_secret_reference_for_sensitive_body(item, f"{path}[{index}]")
+
+
+def _render_template_value(template: Any, state: SubAgentState) -> Any:
+    if isinstance(template, str):
+        return _render_template_string(template, state)
+    if isinstance(template, dict):
+        return {str(key): _render_template_value(value, state) for key, value in template.items()}
+    if isinstance(template, list):
+        return [_render_template_value(item, state) for item in template]
+    return template
+
+
+def _render_template_string(template: str, state: SubAgentState) -> Any:
+    pattern = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+    matches = list(pattern.finditer(template))
+    if not matches:
+        return template
+
+    if len(matches) == 1 and matches[0].span() == (0, len(template)):
+        return _resolve_template_reference(matches[0].group(1), state)
+
+    rendered = template
+    for match in matches:
+        placeholder = match.group(0)
+        resolved = _resolve_template_reference(match.group(1), state)
+        rendered = rendered.replace(placeholder, str(resolved))
+    return rendered
+
+
+def _resolve_template_reference(reference: str, state: SubAgentState) -> Any:
+    path = reference.strip()
+    if path.startswith("state."):
+        path = path[len("state.") :]
+
+    if path.startswith("secret."):
+        secret_key = path[len("secret.") :].strip()
+        return _resolve_secret(secret_key)
+    if path.startswith("secrets."):
+        secret_key = path[len("secrets.") :].strip()
+        return _resolve_secret(secret_key)
+
+    return _resolve_state_reference(state, path)
+
+
+def _resolve_secret(secret_key: str) -> str:
+    if not secret_key:
+        raise RuntimeError("Secret placeholder must include a key name.")
+
+    secret_value = settings.service_call_secrets.get(secret_key)
+    if secret_value is None:
+        raise RuntimeError(f"Secret '{secret_key}' is not configured on the server.")
+    return secret_value
+
+
+def _resolve_state_reference(state: SubAgentState, path: str) -> Any:
+    if not path:
+        raise RuntimeError("Template placeholder path cannot be empty.")
+
+    current: Any = state
+    parts = [part.strip() for part in path.split(".") if part.strip()]
+    if not parts:
+        raise RuntimeError("Template placeholder path cannot be empty.")
+
+    for part in parts:
+        if isinstance(current, dict):
+            if part not in current:
+                raise RuntimeError(f"Template placeholder '{path}' references missing field '{part}'.")
+            current = current[part]
+            continue
+
+        if isinstance(current, list) and part.isdigit():
+            index = int(part)
+            if index < 0 or index >= len(current):
+                raise RuntimeError(f"Template placeholder '{path}' references invalid list index '{part}'.")
+            current = current[index]
+            continue
+
+        raise RuntimeError(f"Template placeholder '{path}' cannot resolve segment '{part}'.")
+
+    return current
+
+
+def _execute_tool_service_call(config: ServiceCallConfig, state: SubAgentState) -> dict[str, Any]:
+    tool_definition = _run_async(_fetch_tool_definition(config.tool_name, config.tool_id))
+    if tool_definition is None:
+        raise RuntimeError("Referenced tool is not registered.")
+
+    executor = _get_tool_executor(config, tool_definition)
+    if executor is None:
+        raise RuntimeError(
+            "No executor registered for tool reference. Register a tool executor on the server first."
+        )
+
+    rendered_input = _render_template_value(config.tool_input_template, state)
+    if not isinstance(rendered_input, dict):
+        raise RuntimeError("Rendered tool_input_template must be a JSON object.")
+    tool_input = cast(dict[str, Any], rendered_input)
+    try:
+        result = executor(tool_input, state)
+    except Exception as exc:  # pragma: no cover - defensive path around integration code.
+        raise RuntimeError(f"Tool executor failed: {exc}") from exc
+
+    return {
+        "mode": "tool",
+        "tool_id": str(tool_definition.id),
+        "tool_name": tool_definition.name,
+        "result": result,
+    }
+
+
+def _get_tool_executor(config: ServiceCallConfig, tool_definition: ToolDefinition) -> ToolExecutor | None:
+    if config.tool_id and config.tool_id in _TOOL_EXECUTORS_BY_ID:
+        return _TOOL_EXECUTORS_BY_ID[config.tool_id]
+    if config.tool_name and config.tool_name in _TOOL_EXECUTORS_BY_NAME:
+        return _TOOL_EXECUTORS_BY_NAME[config.tool_name]
+
+    tool_id = str(tool_definition.id)
+    if tool_id in _TOOL_EXECUTORS_BY_ID:
+        return _TOOL_EXECUTORS_BY_ID[tool_id]
+    if tool_definition.name in _TOOL_EXECUTORS_BY_NAME:
+        return _TOOL_EXECUTORS_BY_NAME[tool_definition.name]
+    return None
+
+
+async def _fetch_tool_definition(tool_name: str | None, tool_id: str | None) -> ToolDefinition | None:
+    async with AsyncSessionLocal() as session:
+        if tool_id:
+            try:
+                normalized_id = uuid.UUID(tool_id.strip())
+            except ValueError as exc:
+                raise RuntimeError(f"Invalid tool_id '{tool_id}'.") from exc
+
+            result = await session.execute(select(ToolDefinition).where(ToolDefinition.id == normalized_id))
+            tool = result.scalar_one_or_none()
+            if tool is not None:
+                return tool
+
+        if tool_name:
+            result = await session.execute(select(ToolDefinition).where(ToolDefinition.name == tool_name.strip()))
+            return result.scalar_one_or_none()
+
+    return None
 
 
 def _execute_user_interrupt(node: AgentNode, state: SubAgentState) -> SubAgentState:

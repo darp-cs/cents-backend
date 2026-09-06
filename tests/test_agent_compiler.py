@@ -2,23 +2,38 @@ from __future__ import annotations
 
 import copy
 from typing import Any
+import uuid
 
+import httpx
 import pytest
 
 from app.agents.compiler import (
     clear_compiled_agent_graph_cache,
+    clear_tool_executors,
     compile_agent_graph,
     get_compiled_agent_graph,
     invalidate_compiled_agent_graph,
+    register_tool_executor,
 )
+from app.config import settings
 from app.agents.template_schema import AgentTemplate
 
 
 @pytest.fixture(autouse=True)
 def reset_compiler_cache() -> None:
     clear_compiled_agent_graph_cache()
+    clear_tool_executors()
     yield
     clear_compiled_agent_graph_cache()
+    clear_tool_executors()
+
+
+@pytest.fixture(autouse=True)
+def mock_http_service_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_http_request(**kwargs) -> httpx.Response:
+        return httpx.Response(status_code=200, json={"ok": True, "echo": kwargs.get("json")})
+
+    monkeypatch.setattr("app.agents.compiler.httpx.request", _fake_http_request)
 
 
 @pytest.fixture
@@ -42,10 +57,10 @@ def linear_template_dict() -> dict:
                 "id": "call_service",
                 "type": "service_call",
                 "config": {
-                    "service": "ledger",
-                    "operation": "record",
-                    "parameters": {"amount": 10},
-                    "output_key": "result",
+                    "mode": "http",
+                    "url": "http://localhost/mock",
+                    "method": "POST",
+                    "body_template": {"amount": 10},
                 },
                 "next": "respond",
             },
@@ -79,7 +94,8 @@ def test_compile_agent_graph_executes_linear_flow(linear_template_dict: dict) ->
 
     assert result["final_response"] == "ok"
     assert result["parsed_data"]["parsed_input"] == "hello"
-    assert result["service_results"]["call_service"]["status"] == "stubbed"
+    assert result["service_results"]["call_service"]["mode"] == "http"
+    assert result["service_results"]["call_service"]["status_code"] == 200
     assert result["iteration_count"] >= 3
 
 
@@ -231,6 +247,322 @@ def test_structured_parser_without_on_failure_raises_clear_error(
         compiled_graph.invoke(_base_state())
 
     assert "Structured parser node 'parse' failed" in str(exc.value)
+
+
+def test_service_call_non_2xx_routes_to_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "call_service",
+        "nodes": [
+            {
+                "id": "call_service",
+                "type": "service_call",
+                "config": {
+                    "mode": "http",
+                    "url": "http://localhost/service",
+                    "method": "GET",
+                },
+                "next": "success_response",
+                "on_failure": "failure_response",
+            },
+            {
+                "id": "success_response",
+                "type": "terminal_response",
+                "config": {"template": "success"},
+            },
+            {
+                "id": "failure_response",
+                "type": "terminal_response",
+                "config": {"template": "failure"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    def _fake_http_request(**_: Any) -> httpx.Response:
+        return httpx.Response(status_code=503, text="service unavailable")
+
+    monkeypatch.setattr("app.agents.compiler.httpx.request", _fake_http_request)
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(_base_state())
+
+    assert result["final_response"] == "failure"
+    assert result["service_results"]["call_service"]["__status__"] == "failure"
+
+
+def test_service_call_disallowed_host_routes_to_on_failure() -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "call_service",
+        "nodes": [
+            {
+                "id": "call_service",
+                "type": "service_call",
+                "config": {
+                    "mode": "http",
+                    "url": "http://internal-only.example/service",
+                    "method": "GET",
+                },
+                "next": "success_response",
+                "on_failure": "failure_response",
+            },
+            {
+                "id": "success_response",
+                "type": "terminal_response",
+                "config": {"template": "success"},
+            },
+            {
+                "id": "failure_response",
+                "type": "terminal_response",
+                "config": {"template": "failure"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(_base_state())
+
+    assert result["final_response"] == "failure"
+    assert "not in service_call_allowed_hosts" in result["service_results"]["call_service"]["error"]
+
+
+def test_service_call_allow_unsafe_requires_server_opt_in() -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "call_service",
+        "nodes": [
+            {
+                "id": "call_service",
+                "type": "service_call",
+                "config": {
+                    "mode": "http",
+                    "url": "http://external.example/service",
+                    "method": "GET",
+                    "allow_unsafe_destination": True,
+                },
+                "next": "success_response",
+                "on_failure": "failure_response",
+            },
+            {
+                "id": "success_response",
+                "type": "terminal_response",
+                "config": {"template": "success"},
+            },
+            {
+                "id": "failure_response",
+                "type": "terminal_response",
+                "config": {"template": "failure"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    previous_flag = settings.service_call_allow_unsafe_destinations
+    settings.service_call_allow_unsafe_destinations = False
+    try:
+        compiled_graph = compile_agent_graph(template)
+        result = compiled_graph.invoke(_base_state())
+    finally:
+        settings.service_call_allow_unsafe_destinations = previous_flag
+
+    assert result["final_response"] == "failure"
+
+
+def test_service_call_timeout_without_on_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "call_service",
+        "nodes": [
+            {
+                "id": "call_service",
+                "type": "service_call",
+                "config": {
+                    "mode": "http",
+                    "url": "http://localhost/service",
+                    "method": "GET",
+                    "timeout_seconds": 1,
+                },
+                "next": "success_response",
+            },
+            {
+                "id": "success_response",
+                "type": "terminal_response",
+                "config": {"template": "success"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    def _fake_http_request(**_: Any) -> httpx.Response:
+        raise httpx.TimeoutException("timeout")
+
+    monkeypatch.setattr("app.agents.compiler.httpx.request", _fake_http_request)
+
+    compiled_graph = compile_agent_graph(template)
+    with pytest.raises(RuntimeError) as exc:
+        compiled_graph.invoke(_base_state())
+
+    assert "Service call node 'call_service' failed" in str(exc.value)
+
+
+def test_service_call_sensitive_header_requires_secret_reference() -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "call_service",
+        "nodes": [
+            {
+                "id": "call_service",
+                "type": "service_call",
+                "config": {
+                    "mode": "http",
+                    "url": "http://localhost/service",
+                    "method": "GET",
+                    "headers_template": {"Authorization": "Bearer plain-text-key"},
+                },
+                "next": "success_response",
+            },
+            {
+                "id": "success_response",
+                "type": "terminal_response",
+                "config": {"template": "success"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    compiled_graph = compile_agent_graph(template)
+    with pytest.raises(RuntimeError) as exc:
+        compiled_graph.invoke(_base_state())
+
+    assert "Sensitive header 'Authorization'" in str(exc.value)
+
+
+def test_service_call_sensitive_body_field_requires_secret_reference() -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "call_service",
+        "nodes": [
+            {
+                "id": "call_service",
+                "type": "service_call",
+                "config": {
+                    "mode": "http",
+                    "url": "http://localhost/service",
+                    "method": "POST",
+                    "body_template": {"api_key": "plain-text-key"},
+                },
+                "next": "success_response",
+            },
+            {
+                "id": "success_response",
+                "type": "terminal_response",
+                "config": {"template": "success"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    compiled_graph = compile_agent_graph(template)
+    with pytest.raises(RuntimeError) as exc:
+        compiled_graph.invoke(_base_state())
+
+    assert "Sensitive body field 'api_key'" in str(exc.value)
+
+
+def test_service_call_secret_placeholder_uses_server_side_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "call_service",
+        "nodes": [
+            {
+                "id": "call_service",
+                "type": "service_call",
+                "config": {
+                    "mode": "http",
+                    "url": "http://localhost/service",
+                    "method": "GET",
+                    "headers_template": {
+                        "Authorization": "Bearer {{ secret.billing_api_key }}",
+                    },
+                },
+                "next": "success_response",
+            },
+            {
+                "id": "success_response",
+                "type": "terminal_response",
+                "config": {"template": "success"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+    captured_headers: dict[str, str] = {}
+
+    def _fake_http_request(**kwargs: Any) -> httpx.Response:
+        nonlocal captured_headers
+        captured_headers = dict(kwargs.get("headers", {}))
+        return httpx.Response(status_code=200, json={"ok": True})
+
+    monkeypatch.setattr("app.agents.compiler.httpx.request", _fake_http_request)
+
+    previous_secrets = dict(settings.service_call_secrets)
+    settings.service_call_secrets = {"billing_api_key": "server-secret"}
+    try:
+        compiled_graph = compile_agent_graph(template)
+        compiled_graph.invoke(_base_state())
+    finally:
+        settings.service_call_secrets = previous_secrets
+
+    assert captured_headers["Authorization"] == "Bearer server-secret"
+
+
+def test_service_call_tool_reference_uses_registered_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "call_service",
+        "nodes": [
+            {
+                "id": "call_service",
+                "type": "service_call",
+                "config": {
+                    "mode": "tool",
+                    "tool_name": "charge-card",
+                    "tool_input_template": {"amount": "{{ parsed_data.amount }}"},
+                },
+                "next": "success_response",
+            },
+            {
+                "id": "success_response",
+                "type": "terminal_response",
+                "config": {"template": "success"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    async def _fake_fetch_tool_definition(tool_name: str | None, tool_id: str | None):
+        del tool_id
+        return type("ToolRow", (), {"id": uuid.uuid4(), "name": tool_name or "charge-card"})()
+
+    monkeypatch.setattr("app.agents.compiler._fetch_tool_definition", _fake_fetch_tool_definition)
+
+    register_tool_executor(
+        tool_name="charge-card",
+        executor=lambda payload, _: {"charged": True, "amount": payload["amount"]},
+    )
+
+    state = _base_state()
+    state["parsed_data"] = {"amount": 120}
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(state)
+
+    assert result["service_results"]["call_service"]["mode"] == "tool"
+    assert result["service_results"]["call_service"]["result"]["charged"] is True
+    assert result["service_results"]["call_service"]["result"]["amount"] == 120
 
 
 def test_condition_node_routes_boolean_true_false() -> None:
