@@ -28,7 +28,8 @@ def valid_template() -> dict:
                 "type": "structured_parser",
                 "config": {
                     "source_key": "last_message",
-                    "output_key": "parsed_request",
+                    "strategy": "regex",
+                    "regex_patterns": {"amount": r"amount\\s*[:=]\\s*(-?\\d+(?:\\.\\d+)?)"},
                     "fields": [
                         {"name": "amount", "type": "number"},
                         {"name": "category", "type": "string", "required": False},
@@ -136,6 +137,18 @@ def test_dangling_branch_target_is_rejected(valid_template: dict) -> None:
     assert not result.is_valid
     assert result.errors == [
         "Node 'check_amount' branches['false'] points to unknown node id 'missing_node'."
+    ]
+
+
+def test_dangling_on_failure_target_is_rejected(valid_template: dict) -> None:
+    template = copy.deepcopy(valid_template)
+    template["nodes"][0]["on_failure"] = "missing_fallback"
+
+    result = validate_template(template)
+
+    assert not result.is_valid
+    assert result.errors == [
+        "Node 'parse_request' on_failure points to unknown node id 'missing_fallback'."
     ]
 
 

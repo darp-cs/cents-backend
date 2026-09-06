@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from typing import Any
 
 import pytest
 
@@ -31,7 +32,8 @@ def linear_template_dict() -> dict:
                 "type": "structured_parser",
                 "config": {
                     "source_key": "input",
-                    "output_key": "parsed_input",
+                    "strategy": "regex",
+                    "regex_patterns": {"parsed_input": r"(hello)"},
                     "fields": [{"name": "parsed_input", "type": "string"}],
                 },
                 "next": "call_service",
@@ -79,6 +81,156 @@ def test_compile_agent_graph_executes_linear_flow(linear_template_dict: dict) ->
     assert result["parsed_data"]["parsed_input"] == "hello"
     assert result["service_results"]["call_service"]["status"] == "stubbed"
     assert result["iteration_count"] >= 3
+
+
+def test_structured_parser_merges_new_fields_without_overwriting_existing_data(
+    linear_template_dict: dict,
+) -> None:
+    template_payload = copy.deepcopy(linear_template_dict)
+    template_payload["nodes"][0]["config"]["fields"] = [
+        {"name": "amount", "type": "number"},
+        {"name": "category", "type": "enum", "enum_values": ["food", "rent"]},
+    ]
+    template_payload["nodes"][0]["config"]["regex_patterns"] = {
+        "amount": r"amount\s*[:=]\s*(-?\d+(?:\.\d+)?)",
+    }
+
+    template = AgentTemplate.model_validate(template_payload)
+    compiled_graph = compile_agent_graph(template)
+
+    state = _base_state()
+    state["input"] = "amount: 42 and category food"
+    state["parsed_data"] = {"existing": "keep_me"}
+
+    result = compiled_graph.invoke(state)
+
+    assert result["parsed_data"]["existing"] == "keep_me"
+    assert result["parsed_data"]["amount"] == 42
+    assert result["parsed_data"]["category"] == "food"
+
+
+def test_structured_parser_llm_strategy_parses_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "parse",
+        "nodes": [
+            {
+                "id": "parse",
+                "type": "structured_parser",
+                "config": {
+                    "source_key": "input",
+                    "strategy": "llm",
+                    "fields": [
+                        {"name": "amount", "type": "number"},
+                        {"name": "category", "type": "string"},
+                    ],
+                },
+                "next": "respond",
+            },
+            {
+                "id": "respond",
+                "type": "terminal_response",
+                "config": {"template": "done"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    captured_payload: dict[str, Any] = {}
+
+    async def _fake_generate_text(payload: dict[str, Any]) -> dict[str, Any]:
+        captured_payload.update(payload)
+        return {"text": '{"amount": 73, "category": "groceries"}'}
+
+    monkeypatch.setattr("app.agents.compiler.generate_text", _fake_generate_text)
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(_base_state())
+
+    assert result["parsed_data"]["amount"] == 73
+    assert result["parsed_data"]["category"] == "groceries"
+    assert "return JSON only" in captured_payload["system_prompt"]
+
+
+def test_structured_parser_on_failure_routes_to_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "parse",
+        "nodes": [
+            {
+                "id": "parse",
+                "type": "structured_parser",
+                "config": {
+                    "source_key": "input",
+                    "strategy": "llm",
+                    "fields": [{"name": "amount", "type": "number"}],
+                },
+                "next": "success_response",
+                "on_failure": "failure_response",
+            },
+            {
+                "id": "success_response",
+                "type": "terminal_response",
+                "config": {"template": "success"},
+            },
+            {
+                "id": "failure_response",
+                "type": "terminal_response",
+                "config": {"template": "fallback"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    async def _fake_generate_text(_: dict[str, Any]) -> dict[str, Any]:
+        return {"text": "not json"}
+
+    monkeypatch.setattr("app.agents.compiler.generate_text", _fake_generate_text)
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(_base_state())
+
+    assert result["final_response"] == "fallback"
+    assert "parse" in result["parsed_data"]["__parser_errors__"]
+
+
+def test_structured_parser_without_on_failure_raises_clear_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "parse",
+        "nodes": [
+            {
+                "id": "parse",
+                "type": "structured_parser",
+                "config": {
+                    "source_key": "input",
+                    "strategy": "llm",
+                    "fields": [{"name": "amount", "type": "number"}],
+                },
+                "next": "success_response",
+            },
+            {
+                "id": "success_response",
+                "type": "terminal_response",
+                "config": {"template": "success"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    async def _fake_generate_text(_: dict[str, Any]) -> dict[str, Any]:
+        return {"text": "{\"amount\": \"NaN\"}"}
+
+    monkeypatch.setattr("app.agents.compiler.generate_text", _fake_generate_text)
+
+    compiled_graph = compile_agent_graph(template)
+
+    with pytest.raises(RuntimeError) as exc:
+        compiled_graph.invoke(_base_state())
+
+    assert "Structured parser node 'parse' failed" in str(exc.value)
 
 
 def test_compile_agent_graph_condition_branches(linear_template_dict: dict) -> None:

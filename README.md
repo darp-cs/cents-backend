@@ -122,6 +122,7 @@ Validated templates are compiled into isolated executable graphs in `app/agents/
 - Transition rules:
     - Non-terminal nodes use `next`
     - `condition` nodes use `branches`
+    - `structured_parser` nodes can optionally define `on_failure`
     - `terminal_response` nodes end execution
 
 ### Validation behavior
@@ -141,6 +142,9 @@ Use `validate_template(raw_json)` to parse and validate templates. It checks:
 - Node execution is dispatched by node `type` through a compiler dispatch table.
 - `entry_node` is used as the graph entry point.
 - `next` and `branches` are translated into LangGraph edges.
+- `structured_parser` supports deterministic extraction (`regex`/keyword) and LLM extraction (`llm`).
+- Parser output is merged into `parsed_data` by field name so multiple parser nodes can contribute fields.
+- Parser failures route to `on_failure` when configured, otherwise the run raises a clear parser error.
 - Compiled graphs are cached per `(name, version)` for reuse.
 
 ### Minimal example
@@ -160,10 +164,19 @@ Use `validate_template(raw_json)` to parse and validate templates. It checks:
             "type": "structured_parser",
             "config": {
                 "source_key": "last_message",
-                "output_key": "parsed_request",
+                "strategy": "regex",
+                "regex_patterns": {
+                    "amount": "amount\\\\s*[:=]\\\\s*(-?\\\\d+(?:\\\\.\\\\d+)?)"
+                },
                 "fields": [{"name": "amount", "type": "number"}]
             },
+            "on_failure": "fallback_response",
             "next": "respond"
+        },
+        {
+            "id": "fallback_response",
+            "type": "terminal_response",
+            "config": {"template": "Could not parse input."}
         },
         {
             "id": "respond",

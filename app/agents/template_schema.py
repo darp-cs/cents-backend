@@ -23,7 +23,13 @@ class ParsedField(_StrictModel):
 
 class StructuredParserConfig(_StrictModel):
     source_key: str = Field(default="last_message", min_length=1)
-    output_key: str = Field(min_length=1)
+    strategy: Literal["regex", "llm"] = "regex"
+    regex_patterns: dict[str, str] = Field(default_factory=dict)
+    llm_prompt_instructions: str | None = None
+    llm_model_type: str | None = None
+    llm_model: str | None = None
+    llm_temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    llm_max_tokens: int | None = Field(default=None, ge=1, le=4096)
     fields: list[ParsedField] = Field(min_length=1)
     strict: bool = False
 
@@ -76,6 +82,7 @@ class StructuredParserNode(_BaseNode):
     type: Literal["structured_parser"]
     config: StructuredParserConfig
     next: str = Field(pattern=NODE_ID_PATTERN)
+    on_failure: str | None = Field(default=None, pattern=NODE_ID_PATTERN)
 
 
 class ConditionNode(_BaseNode):
@@ -171,6 +178,8 @@ def _outgoing_edges(node: AgentNode) -> list[tuple[str, str]]:
         return [(f"branches['{key}']", target) for key, target in node.branches.items()]
     if isinstance(node, TerminalResponseNode):
         return []
+    if isinstance(node, StructuredParserNode) and node.on_failure:
+        return [("next", node.next), ("on_failure", node.on_failure)]
     return [("next", node.next)]
 
 
