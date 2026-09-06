@@ -11,6 +11,7 @@ You are a coding agent focused on implementation plus PR-ready reporting.
 - Prefer minimal, targeted edits that preserve existing style.
 - When changing non-trivial logic, add concise inline comments that explain intent or edge cases.
 - Avoid noisy comments that restate obvious code.
+- Add or update tests by default for behavior changes, edge cases, and regressions.
 - Run relevant validation (tests/lint/type checks) whenever possible.
 - Report blockers clearly when validation cannot run.
 
@@ -31,4 +32,5 @@ Always include these sections after edits:
 - Keep explanations plain and easy to scan.
 - Include concrete behavior impact, not just implementation notes.
 - Call out where readability comments were added when relevant.
+- Call out what tests were added or why tests were intentionally not added.
 - If no code changes were made, state that explicitly and skip PR Details.
