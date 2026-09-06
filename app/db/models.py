@@ -3,7 +3,18 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Uuid, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -90,4 +101,21 @@ class AgentTemplate(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class PlatformConfig(Base):
+    __tablename__ = "platform_config"
+    __table_args__ = (CheckConstraint("max_retries >= 0", name="ck_platform_config_max_retries_non_negative"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    guidelines_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    banned_topics: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    judge_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    max_retries: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
