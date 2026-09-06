@@ -123,6 +123,7 @@ Validated templates are compiled into isolated executable graphs in `app/agents/
     - Non-terminal nodes use `next`
     - `condition` nodes use `branches` and must include a `default` key
     - `structured_parser` nodes can optionally define `on_failure`
+    - `service_call` nodes can optionally define `on_failure`
     - `terminal_response` nodes end execution
 
 ### Validation behavior
@@ -148,6 +149,13 @@ Use `validate_template(raw_json)` to parse and validate templates. It checks:
 - `structured_parser` supports deterministic extraction (`regex`/keyword) and LLM extraction (`llm`).
 - Parser output is merged into `parsed_data` by field name so multiple parser nodes can contribute fields.
 - Parser failures route to `on_failure` when configured, otherwise the run raises a clear parser error.
+- `service_call` supports:
+    - `mode=http`: configured `url` + `method`, with header/body template interpolation from state
+    - `mode=tool`: reference to a registered `ToolDefinition` by `tool_name` or `tool_id`
+- HTTP service calls are SSRF-protected via `SERVICE_CALL_ALLOWED_HOSTS` unless unsafe destinations are explicitly enabled server-side.
+- Sensitive headers/body fields must reference server-side secrets using placeholders (for example `{{ secret.my_api_key }}`), never hardcoded values in templates.
+- Service call responses are stored at `service_results[node_id]`.
+- Non-2xx responses and timeouts route to `on_failure` when configured; otherwise they raise a clear runtime error.
 - Compiled graphs are cached per `(name, version)` for reuse.
 
 ### Minimal example
@@ -316,6 +324,10 @@ Important variables:
 - LLM_JUDGE_ENABLED
 - LLM_DEFAULT_TEMPERATURE
 - LLM_DEFAULT_MAX_TOKENS
+- SERVICE_CALL_ALLOWED_HOSTS
+- SERVICE_CALL_ALLOW_UNSAFE_DESTINATIONS
+- SERVICE_CALL_DEFAULT_TIMEOUT_SECONDS
+- SERVICE_CALL_SECRETS
 
 Default local values already target SQLite + Chroma.
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 NODE_ID_PATTERN = r"^[A-Za-z][A-Za-z0-9_-]*$"
 TEMPLATE_VERSION_PATTERN = r"^\d+\.\d+(\.\d+)?$"
@@ -40,12 +40,31 @@ class ConditionConfig(_StrictModel):
 
 
 class ServiceCallConfig(_StrictModel):
-    service: str = Field(min_length=1)
-    operation: str = Field(min_length=1)
-    parameters: dict[str, Any] = Field(default_factory=dict)
-    output_key: str = Field(min_length=1)
+    mode: Literal["http", "tool"] = "http"
+    url: str | None = None
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] = "GET"
+    headers_template: dict[str, str] = Field(default_factory=dict)
+    body_template: dict[str, Any] | None = None
+    tool_name: str | None = None
+    tool_id: str | None = None
+    tool_input_template: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: int | None = Field(default=None, ge=1, le=600)
-    on_error: Literal["fail", "continue"] = "fail"
+    allow_unsafe_destination: bool = False
+
+    @model_validator(mode="after")
+    def validate_mode_requirements(self) -> ServiceCallConfig:
+        if self.mode == "http":
+            if not self.url or not self.url.strip():
+                raise ValueError("service_call mode='http' requires a non-empty url.")
+            if self.tool_name or self.tool_id:
+                raise ValueError("service_call mode='http' cannot include tool_name or tool_id.")
+            return self
+
+        if not self.tool_name and not self.tool_id:
+            raise ValueError("service_call mode='tool' requires tool_name or tool_id.")
+        if self.url:
+            raise ValueError("service_call mode='tool' cannot include url.")
+        return self
 
 
 class UserInterruptConfig(_StrictModel):
@@ -102,6 +121,7 @@ class ServiceCallNode(_BaseNode):
     type: Literal["service_call"]
     config: ServiceCallConfig
     next: str = Field(pattern=NODE_ID_PATTERN)
+    on_failure: str | None = Field(default=None, pattern=NODE_ID_PATTERN)
 
 
 class UserInterruptNode(_BaseNode):
@@ -185,6 +205,8 @@ def _outgoing_edges(node: AgentNode) -> list[tuple[str, str]]:
         return [(f"branches['{key}']", target) for key, target in node.branches.items()]
     if isinstance(node, TerminalResponseNode):
         return []
+    if isinstance(node, ServiceCallNode) and node.on_failure:
+        return [("next", node.next), ("on_failure", node.on_failure)]
     if isinstance(node, StructuredParserNode) and node.on_failure:
         return [("next", node.next), ("on_failure", node.on_failure)]
     return [("next", node.next)]
