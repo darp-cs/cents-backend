@@ -164,6 +164,7 @@ async def chat(
     state = {
         "messages": [{"role": "user", "content": payload.message}],
         "user_id": user_id,
+        "conversation_id": payload.conversation_id,
         "thread_id": thread_id,
         "node_llm_configs": effective_node_llm_configs,
         "retry_count": 0,

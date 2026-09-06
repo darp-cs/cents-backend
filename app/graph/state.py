@@ -10,6 +10,7 @@ class GraphState(TypedDict, total=False):
     messages: list[dict[str, Any]]
     user_id: str
     thread_id: str
+    conversation_id: str | None
     node_llm_configs: dict[str, NodeLLMConfig]
     retrieved_docs: list[dict[str, Any]]
     retrieved_tools: list[dict[str, Any]]

@@ -51,6 +51,26 @@ class ConversationModelConfig(Base):
     )
 
 
+class MetricEvent(Base):
+    __tablename__ = "metric_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("conversations.id"), index=True, nullable=True
+    )
+    node_key: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    latency_ms: Mapped[float | None] = mapped_column(nullable=True)
+    prompt_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    retrieved_count: Mapped[int | None] = mapped_column(nullable=True)
+    judge_verdict: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class Document(Base):
     __tablename__ = "documents"
 
