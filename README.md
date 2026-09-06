@@ -244,6 +244,23 @@ Endpoints:
 - DELETE /agents/{name}
     - Deletes all versions for that template name.
 
+### Agent authoring metadata and dry-run validation
+
+These endpoints support editor experiences (JSON and visual) without creating temporary database rows.
+
+Endpoints:
+
+- GET /agents/authoring/schema
+    - Returns a versioned authoring catalog derived from the Pydantic workflow schema.
+    - Includes supported node types, config field metadata (type/default/required/options), and transition kinds.
+- POST /agents/authoring/validate
+    - Accepts `{ "raw_template": { ... } }` and runs non-persisting validation.
+    - Returns:
+        - `is_valid`
+        - `normalized_template` when the payload is parseable
+        - structured `errors` with `path`, optional `node_id`, and `message`
+    - Does not create, update, delete, compile, or enable `AgentTemplate` records.
+
 ### Sub-agent run streaming
 
 Long-running template execution now supports server-sent event (SSE) streaming.

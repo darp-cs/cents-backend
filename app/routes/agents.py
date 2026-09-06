@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal, get_args, get_origin
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.responses import StreamingResponse
 from langgraph.types import Command
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,7 +20,19 @@ from app.agents.compiler import (
     invalidate_compiled_agent_graph,
     set_runtime_event_emitter,
 )
-from app.agents.template_schema import validate_template
+from app.agents.template_schema import (
+    AgentTemplate as AgentTemplateSchema,
+    ConditionNode,
+    Guardrails,
+    LLMStepNode,
+    NODE_ID_PATTERN,
+    ServiceCallNode,
+    StructuredParserNode,
+    TEMPLATE_VERSION_PATTERN,
+    TerminalResponseNode,
+    UserInterruptNode,
+    validate_template,
+)
 from app.auth.users import current_active_user
 from app.config import settings
 from app.db.base import get_async_session
@@ -93,9 +106,330 @@ class AgentRunResumeRequest(BaseModel):
     answer: Any
 
 
+class AgentAuthoringValidateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    raw_template: Any
+
+
+class AgentAuthoringValidationError(BaseModel):
+    path: str = Field(min_length=1)
+    node_id: str | None = None
+    message: str = Field(min_length=1)
+
+
+class AgentAuthoringValidateResponse(BaseModel):
+    is_valid: bool
+    normalized_template: dict[str, Any] | None = None
+    errors: list[AgentAuthoringValidationError] = Field(default_factory=list)
+
+
+class AgentAuthoringSchemaField(BaseModel):
+    name: str = Field(min_length=1)
+    type: str = Field(min_length=1)
+    required: bool
+    default: Any = None
+    options: list[Any] | None = None
+    constraints: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentAuthoringNodeTransition(BaseModel):
+    kind: Literal["next", "on_failure", "branches"]
+    required: bool
+    details: dict[str, Any] | None = None
+
+
+class AgentAuthoringNodeTypeSchema(BaseModel):
+    type: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    config_fields: list[AgentAuthoringSchemaField]
+    transitions: list[AgentAuthoringNodeTransition]
+
+
+class AgentAuthoringSchemaResponse(BaseModel):
+    catalog_version: str = Field(min_length=1)
+    template_version_pattern: str = Field(min_length=1)
+    node_id_pattern: str = Field(min_length=1)
+    guardrails_fields: list[AgentAuthoringSchemaField]
+    node_types: list[AgentAuthoringNodeTypeSchema]
+
+
+_NODE_SCHEMA_MODELS = [
+    StructuredParserNode,
+    ConditionNode,
+    ServiceCallNode,
+    UserInterruptNode,
+    LLMStepNode,
+    TerminalResponseNode,
+]
+
+_UNKNOWN_EDGE_PATTERN = re.compile(
+    r"^Node '([^']+)' (next|on_failure) points to unknown node id '[^']+'\.$"
+)
+_UNKNOWN_BRANCH_PATTERN = re.compile(
+    r"^Node '([^']+)' branches\['([^']+)'\] points to unknown node id '[^']+'\.$"
+)
+_NODE_PATH_ONLY_PATTERN = re.compile(
+    r"^Node '([^']+)' (is unreachable from entry_node '[^']+'|cannot reach a 'terminal_response' node)\.$"
+)
+_DUPLICATE_NODE_PATTERN = re.compile(r"^Duplicate node id '([^']+)'\.$")
+_ENTRY_NODE_PATTERN = re.compile(r"^entry_node '[^']+' does not match any node id\.$")
+
+
 def _clear_agent_run_registry() -> None:
     with _RUN_REGISTRY_LOCK:
         _RUN_REGISTRY.clear()
+
+
+def _unwrap_optional_annotation(annotation: Any) -> Any:
+    args = [arg for arg in get_args(annotation) if arg is not type(None)]
+    if len(args) == 1:
+        return args[0]
+    return annotation
+
+
+def _extract_literal_options(annotation: Any) -> list[Any] | None:
+    target = _unwrap_optional_annotation(annotation)
+    if get_origin(target) is Literal:
+        return list(get_args(target))
+    return None
+
+
+def _humanize_identifier(value: str) -> str:
+    return value.replace("_", " ").strip().title()
+
+
+def _describe_annotation(annotation: Any) -> str:
+    target = _unwrap_optional_annotation(annotation)
+    origin = get_origin(target)
+
+    if origin is Literal:
+        literal_values = list(get_args(target))
+        if not literal_values:
+            return "string"
+        value_type = type(literal_values[0])
+        if value_type is bool:
+            return "boolean"
+        if value_type in (int, float):
+            return "number"
+        return "string"
+
+    if origin in (list, tuple, set):
+        return "array"
+    if origin is dict:
+        return "object"
+
+    if target is str:
+        return "string"
+    if target is bool:
+        return "boolean"
+    if target in (int, float):
+        return "number"
+    if isinstance(target, type) and issubclass(target, BaseModel):
+        return "object"
+
+    return "unknown"
+
+
+def _extract_field_constraints(field_info) -> dict[str, Any]:
+    constraints: dict[str, Any] = {}
+    for metadata in field_info.metadata:
+        for key in ("min_length", "max_length", "ge", "gt", "le", "lt", "pattern"):
+            raw_value = getattr(metadata, key, None)
+            if raw_value is None:
+                continue
+            if key == "pattern" and hasattr(raw_value, "pattern"):
+                constraints[key] = str(raw_value.pattern)
+            else:
+                constraints[key] = raw_value
+    return constraints
+
+
+def _resolve_field_default(field_info) -> Any:
+    if field_info.default_factory is not None:
+        try:
+            return field_info.default_factory()
+        except Exception:
+            return None
+    if field_info.is_required():
+        return None
+    return field_info.default
+
+
+def _build_model_field_catalog(model_cls: type[BaseModel]) -> list[AgentAuthoringSchemaField]:
+    fields: list[AgentAuthoringSchemaField] = []
+    for field_name, field_info in model_cls.model_fields.items():
+        options = _extract_literal_options(field_info.annotation)
+        constraints = _extract_field_constraints(field_info)
+        fields.append(
+            AgentAuthoringSchemaField(
+                name=field_name,
+                type=_describe_annotation(field_info.annotation),
+                required=field_info.is_required(),
+                default=_resolve_field_default(field_info),
+                options=options,
+                constraints=constraints,
+            )
+        )
+    return fields
+
+
+def _build_node_transition_catalog(node_model: type[BaseModel]) -> list[AgentAuthoringNodeTransition]:
+    transitions: list[AgentAuthoringNodeTransition] = []
+    for transition_name in ("next", "on_failure", "branches"):
+        field_info = node_model.model_fields.get(transition_name)
+        if field_info is None:
+            continue
+
+        details: dict[str, Any] | None = None
+        if transition_name == "branches":
+            details = {"branch_key_type": "string", "target_type": "node_id"}
+
+        transitions.append(
+            AgentAuthoringNodeTransition(
+                kind=transition_name,
+                required=field_info.is_required(),
+                details=details,
+            )
+        )
+    return transitions
+
+
+def _build_authoring_schema_catalog() -> AgentAuthoringSchemaResponse:
+    node_types: list[AgentAuthoringNodeTypeSchema] = []
+    for node_model in _NODE_SCHEMA_MODELS:
+        type_options = _extract_literal_options(node_model.model_fields["type"].annotation) or []
+        if type_options:
+            node_type = str(type_options[0])
+        else:
+            type_schema = node_model.model_json_schema().get("properties", {}).get("type", {})
+            node_type = str(type_schema.get("const") or node_model.__name__)
+        config_model = node_model.model_fields["config"].annotation
+        config_fields = (
+            _build_model_field_catalog(config_model)
+            if isinstance(config_model, type) and issubclass(config_model, BaseModel)
+            else []
+        )
+        transitions = _build_node_transition_catalog(node_model)
+        transition_names = ", ".join(transition.kind for transition in transitions) or "none"
+
+        node_types.append(
+            AgentAuthoringNodeTypeSchema(
+                type=node_type,
+                label=_humanize_identifier(node_type),
+                description=f"{_humanize_identifier(node_type)} node. Allowed transitions: {transition_names}.",
+                config_fields=config_fields,
+                transitions=transitions,
+            )
+        )
+
+    return AgentAuthoringSchemaResponse(
+        catalog_version="1.0.0",
+        template_version_pattern=TEMPLATE_VERSION_PATTERN,
+        node_id_pattern=NODE_ID_PATTERN,
+        guardrails_fields=_build_model_field_catalog(Guardrails),
+        node_types=node_types,
+    )
+
+
+def _build_node_index_lookup(raw_template: Any) -> dict[int, str]:
+    if not isinstance(raw_template, dict):
+        return {}
+
+    raw_nodes = raw_template.get("nodes")
+    if not isinstance(raw_nodes, list):
+        return {}
+
+    lookup: dict[int, str] = {}
+    for index, node in enumerate(raw_nodes):
+        if not isinstance(node, dict):
+            continue
+        node_id = node.get("id")
+        if isinstance(node_id, str) and node_id.strip():
+            lookup[index] = node_id.strip()
+    return lookup
+
+
+def _extract_node_id_from_path(path: str, index_lookup: dict[int, str]) -> str | None:
+    segments = path.split(".")
+    if len(segments) < 2 or segments[0] != "nodes":
+        return None
+
+    try:
+        node_index = int(segments[1])
+    except ValueError:
+        return segments[1] if segments[1] else None
+
+    return index_lookup.get(node_index)
+
+
+def _map_error_to_structured(
+    error_text: str,
+    node_index_lookup: dict[int, str],
+) -> AgentAuthoringValidationError:
+    if ": " in error_text and not error_text.startswith("Node '"):
+        raw_path, message = error_text.split(": ", 1)
+        return AgentAuthoringValidationError(
+            path=raw_path,
+            node_id=_extract_node_id_from_path(raw_path, node_index_lookup),
+            message=message,
+        )
+
+    unknown_edge_match = _UNKNOWN_EDGE_PATTERN.match(error_text)
+    if unknown_edge_match is not None:
+        node_id = unknown_edge_match.group(1)
+        transition = unknown_edge_match.group(2)
+        return AgentAuthoringValidationError(path=f"nodes.{node_id}.{transition}", node_id=node_id, message=error_text)
+
+    unknown_branch_match = _UNKNOWN_BRANCH_PATTERN.match(error_text)
+    if unknown_branch_match is not None:
+        node_id = unknown_branch_match.group(1)
+        branch_name = unknown_branch_match.group(2)
+        return AgentAuthoringValidationError(
+            path=f"nodes.{node_id}.branches.{branch_name}",
+            node_id=node_id,
+            message=error_text,
+        )
+
+    node_only_match = _NODE_PATH_ONLY_PATTERN.match(error_text)
+    if node_only_match is not None:
+        node_id = node_only_match.group(1)
+        return AgentAuthoringValidationError(path=f"nodes.{node_id}", node_id=node_id, message=error_text)
+
+    duplicate_node_match = _DUPLICATE_NODE_PATTERN.match(error_text)
+    if duplicate_node_match is not None:
+        node_id = duplicate_node_match.group(1)
+        return AgentAuthoringValidationError(path=f"nodes.{node_id}.id", node_id=node_id, message=error_text)
+
+    if _ENTRY_NODE_PATTERN.match(error_text) is not None:
+        return AgentAuthoringValidationError(path="entry_node", node_id=None, message=error_text)
+
+    if error_text.startswith("Template "):
+        return AgentAuthoringValidationError(path="template", node_id=None, message=error_text)
+
+    return AgentAuthoringValidationError(path="template", node_id=None, message=error_text)
+
+
+def _normalize_template_if_parseable(raw_template: Any, parsed_result) -> dict[str, Any] | None:
+    if parsed_result.template is not None:
+        return parsed_result.template.model_dump(mode="json")
+
+    if not isinstance(raw_template, dict):
+        return None
+
+    try:
+        return AgentTemplateSchema.model_validate(raw_template).model_dump(mode="json")
+    except ValidationError:
+        return None
+
+
+def _build_structured_validation_errors(
+    raw_template: Any,
+    errors: list[str],
+) -> list[AgentAuthoringValidationError]:
+    node_index_lookup = _build_node_index_lookup(raw_template)
+    return [_map_error_to_structured(error_text, node_index_lookup) for error_text in errors]
 
 
 def _coerce_iteration_count(value: Any) -> int:
@@ -586,6 +920,32 @@ async def _create_version(
         get_compiled_agent_graph(name=name, version=next_version, template=result.template)
 
     return record
+
+
+@router.get("/authoring/schema", response_model=AgentAuthoringSchemaResponse)
+async def get_authoring_schema(
+    user: Annotated[User, Depends(current_active_user)],
+):
+    del user
+    return _build_authoring_schema_catalog()
+
+
+@router.post("/authoring/validate", response_model=AgentAuthoringValidateResponse)
+async def validate_authoring_template(
+    payload: AgentAuthoringValidateRequest,
+    user: Annotated[User, Depends(current_active_user)],
+):
+    del user
+
+    validation_result = validate_template(payload.raw_template)  # type: ignore[arg-type]
+    normalized_template = _normalize_template_if_parseable(payload.raw_template, validation_result)
+    structured_errors = _build_structured_validation_errors(payload.raw_template, validation_result.errors)
+
+    return AgentAuthoringValidateResponse(
+        is_valid=validation_result.is_valid,
+        normalized_template=normalized_template,
+        errors=structured_errors,
+    )
 
 
 @router.post("", response_model=dict, status_code=status.HTTP_201_CREATED)
