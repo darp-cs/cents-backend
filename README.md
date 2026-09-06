@@ -121,7 +121,7 @@ Validated templates are compiled into isolated executable graphs in `app/agents/
     - `terminal_response`
 - Transition rules:
     - Non-terminal nodes use `next`
-    - `condition` nodes use `branches`
+    - `condition` nodes use `branches` and must include a `default` key
     - `structured_parser` nodes can optionally define `on_failure`
     - `terminal_response` nodes end execution
 
@@ -142,6 +142,9 @@ Use `validate_template(raw_json)` to parse and validate templates. It checks:
 - Node execution is dispatched by node `type` through a compiler dispatch table.
 - `entry_node` is used as the graph entry point.
 - `next` and `branches` are translated into LangGraph edges.
+- `condition` evaluates a safe allow-listed expression against `parsed_data` and `service_results` (no arbitrary `eval`).
+- Condition expression results resolve to branch keys; unmatched keys and evaluation errors route to `default`.
+- Condition evaluation errors are captured for observability instead of crashing the graph.
 - `structured_parser` supports deterministic extraction (`regex`/keyword) and LLM extraction (`llm`).
 - Parser output is merged into `parsed_data` by field name so multiple parser nodes can contribute fields.
 - Parser failures route to `on_failure` when configured, otherwise the run raises a clear parser error.

@@ -47,6 +47,7 @@ def valid_template() -> dict:
                 "branches": {
                     "true": "confirm_with_user",
                     "false": "call_ledger",
+                    "default": "call_ledger",
                 },
             },
             {
@@ -207,7 +208,7 @@ def test_node_that_cannot_reach_terminal_is_rejected() -> None:
                 "id": "start",
                 "type": "condition",
                 "config": {"expression": "state.ok"},
-                "branches": {"ok": "respond", "stuck": "dead_end_a"},
+                "branches": {"ok": "respond", "stuck": "dead_end_a", "default": "dead_end_a"},
             },
             {
                 "id": "dead_end_a",
@@ -246,6 +247,16 @@ def test_missing_entry_node_is_rejected(valid_template: dict) -> None:
 
     assert not result.is_valid
     assert result.errors == ["entry_node 'nowhere' does not match any node id."]
+
+
+def test_condition_requires_default_branch(valid_template: dict) -> None:
+    template = copy.deepcopy(valid_template)
+    template["nodes"][1]["branches"].pop("default")
+
+    result = validate_template(template)
+
+    assert not result.is_valid
+    assert any("Condition nodes must define a 'default' branch." in error for error in result.errors)
 
 
 def test_duplicate_node_ids_are_rejected(valid_template: dict) -> None:

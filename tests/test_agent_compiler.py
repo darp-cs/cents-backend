@@ -233,44 +233,139 @@ def test_structured_parser_without_on_failure_raises_clear_error(
     assert "Structured parser node 'parse' failed" in str(exc.value)
 
 
-def test_compile_agent_graph_condition_branches(linear_template_dict: dict) -> None:
-    template_payload = copy.deepcopy(linear_template_dict)
-    template_payload["entry_node"] = "route"
-    template_payload["nodes"] = [
-        {
-            "id": "route",
-            "type": "condition",
-            "config": {"expression": "stub"},
-            "branches": {
-                "yes": "yes_response",
-                "no": "no_response",
+def test_condition_node_routes_boolean_true_false() -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "route",
+        "nodes": [
+            {
+                "id": "route",
+                "type": "condition",
+                "config": {"expression": "parsed_data.amount > 100"},
+                "branches": {
+                    "true": "high_response",
+                    "false": "low_response",
+                    "default": "fallback_response",
+                },
             },
-        },
-        {
-            "id": "yes_response",
-            "type": "terminal_response",
-            "config": {"template": "YES"},
-        },
-        {
-            "id": "no_response",
-            "type": "terminal_response",
-            "config": {"template": "NO"},
-        },
-    ]
+            {
+                "id": "high_response",
+                "type": "terminal_response",
+                "config": {"template": "HIGH"},
+            },
+            {
+                "id": "low_response",
+                "type": "terminal_response",
+                "config": {"template": "LOW"},
+            },
+            {
+                "id": "fallback_response",
+                "type": "terminal_response",
+                "config": {"template": "FALLBACK"},
+            },
+        ],
+    }
 
     template = AgentTemplate.model_validate(template_payload)
     compiled_graph = compile_agent_graph(template)
 
-    yes_state = _base_state()
-    yes_state["parsed_data"] = {"branch_overrides": {"route": "yes"}}
-    yes_result = compiled_graph.invoke(yes_state)
+    high_state = _base_state()
+    high_state["parsed_data"] = {"amount": 250}
+    high_result = compiled_graph.invoke(high_state)
 
-    no_state = _base_state()
-    no_state["parsed_data"] = {"route_branch": "no"}
-    no_result = compiled_graph.invoke(no_state)
+    low_state = _base_state()
+    low_state["parsed_data"] = {"amount": 40}
+    low_result = compiled_graph.invoke(low_state)
 
-    assert yes_result["final_response"] == "YES"
-    assert no_result["final_response"] == "NO"
+    assert high_result["final_response"] == "HIGH"
+    assert low_result["final_response"] == "LOW"
+
+
+def test_condition_node_routes_multi_branch_string_match() -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "route",
+        "nodes": [
+            {
+                "id": "route",
+                "type": "condition",
+                "config": {"expression": "parsed_data.category"},
+                "branches": {
+                    "food": "food_response",
+                    "rent": "rent_response",
+                    "default": "other_response",
+                },
+            },
+            {
+                "id": "food_response",
+                "type": "terminal_response",
+                "config": {"template": "FOOD"},
+            },
+            {
+                "id": "rent_response",
+                "type": "terminal_response",
+                "config": {"template": "RENT"},
+            },
+            {
+                "id": "other_response",
+                "type": "terminal_response",
+                "config": {"template": "OTHER"},
+            },
+        ],
+    }
+
+    template = AgentTemplate.model_validate(template_payload)
+    compiled_graph = compile_agent_graph(template)
+
+    state = _base_state()
+    state["parsed_data"] = {"category": "rent"}
+    result = compiled_graph.invoke(state)
+
+    assert result["final_response"] == "RENT"
+
+
+def test_condition_missing_field_routes_to_default_and_records_error() -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "route",
+        "nodes": [
+            {
+                "id": "route",
+                "type": "condition",
+                "config": {"expression": "parsed_data.amount > 100"},
+                "branches": {
+                    "true": "high_response",
+                    "false": "low_response",
+                    "default": "fallback_response",
+                },
+            },
+            {
+                "id": "high_response",
+                "type": "terminal_response",
+                "config": {"template": "HIGH"},
+            },
+            {
+                "id": "low_response",
+                "type": "terminal_response",
+                "config": {"template": "LOW"},
+            },
+            {
+                "id": "fallback_response",
+                "type": "terminal_response",
+                "config": {"template": "FALLBACK"},
+            },
+        ],
+    }
+
+    template = AgentTemplate.model_validate(template_payload)
+    compiled_graph = compile_agent_graph(template)
+
+    state = _base_state()
+    state["parsed_data"] = {}
+    result = compiled_graph.invoke(state)
+
+    assert result["final_response"] == "FALLBACK"
+    assert "route" in result["parsed_data"]["__condition_errors__"]
 
 
 def test_compiled_graphs_are_isolated_per_template(linear_template_dict: dict) -> None:

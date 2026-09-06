@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import re
 import threading
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Hashable, cast
 
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -42,7 +43,11 @@ def compile_agent_graph(template: AgentTemplate) -> CompiledStateGraph:
 
     for node in template.nodes:
         if isinstance(node, ConditionNode):
-            workflow.add_conditional_edges(node.id, _build_condition_router(node), node.branches)
+            workflow.add_conditional_edges(
+                node.id,
+                _build_condition_router(node),
+                cast(dict[Hashable, str], node.branches),
+            )
             continue
 
         if isinstance(node, StructuredParserNode) and node.on_failure:
@@ -102,7 +107,7 @@ def _build_node_handler(node: AgentNode) -> Callable[[SubAgentState], SubAgentSt
 
 def _build_condition_router(node: ConditionNode) -> Callable[[SubAgentState], str]:
     def _router(state: SubAgentState) -> str:
-        return _resolve_condition_branch(node, state)
+        return _resolve_condition_route(node, state)
 
     return _router
 
@@ -114,21 +119,16 @@ def _build_structured_parser_router(node: StructuredParserNode) -> Callable[[Sub
     return _router
 
 
-def _resolve_condition_branch(node: ConditionNode, state: SubAgentState) -> str:
+def _resolve_condition_route(node: ConditionNode, state: SubAgentState) -> str:
     parsed_data = state.get("parsed_data", {})
     if isinstance(parsed_data, dict):
-        branch_overrides = parsed_data.get("branch_overrides")
-        if isinstance(branch_overrides, dict):
-            candidate = branch_overrides.get(node.id)
+        condition_branches = parsed_data.get("__condition_branches__", {})
+        if isinstance(condition_branches, dict):
+            candidate = condition_branches.get(node.id)
             if isinstance(candidate, str) and candidate in node.branches:
                 return candidate
 
-        direct_candidate = parsed_data.get(f"{node.id}_branch")
-        if isinstance(direct_candidate, str) and direct_candidate in node.branches:
-            return direct_candidate
-
-    # Default to the first configured branch for deterministic routing with stub handlers.
-    return next(iter(node.branches))
+    return "default"
 
 
 def _resolve_structured_parser_route(node_id: str, state: SubAgentState) -> str:
@@ -140,9 +140,184 @@ def _resolve_structured_parser_route(node_id: str, state: SubAgentState) -> str:
     return "success"
 
 
+def _evaluate_condition_branch(node: ConditionNode, state: SubAgentState) -> str:
+    parsed_data = state.get("parsed_data", {})
+    service_results = state.get("service_results", {})
+
+    if not isinstance(parsed_data, dict):
+        raise RuntimeError("parsed_data must be an object for condition evaluation.")
+    if not isinstance(service_results, dict):
+        raise RuntimeError("service_results must be an object for condition evaluation.")
+
+    expression_result = _safe_evaluate_expression(
+        expression=node.config.expression,
+        context={
+            "parsed_data": parsed_data,
+            "service_results": service_results,
+        },
+    )
+    branch_key = _normalize_condition_result(expression_result)
+    if branch_key in node.branches:
+        return branch_key
+    return "default"
+
+
+def _safe_evaluate_expression(expression: str, context: dict[str, Any]) -> Any:
+    try:
+        parsed = ast.parse(expression, mode="eval")
+    except SyntaxError as exc:
+        raise RuntimeError(f"Invalid condition expression syntax: {exc.msg}.") from exc
+
+    return _evaluate_ast_node(parsed.body, context)
+
+
+def _evaluate_ast_node(node: ast.AST, context: dict[str, Any]) -> Any:
+    if isinstance(node, ast.Constant):
+        return node.value
+
+    if isinstance(node, ast.Name):
+        if node.id in context:
+            return context[node.id]
+        if node.id == "true":
+            return True
+        if node.id == "false":
+            return False
+        if node.id == "null":
+            return None
+        raise RuntimeError(f"Unsupported name '{node.id}' in condition expression.")
+
+    if isinstance(node, ast.Attribute):
+        target = _evaluate_ast_node(node.value, context)
+        if isinstance(target, dict):
+            if node.attr in target:
+                return target[node.attr]
+            raise RuntimeError(f"Missing field '{node.attr}' in condition expression.")
+        raise RuntimeError("Attribute access is only supported on objects in condition expressions.")
+
+    if isinstance(node, ast.Subscript):
+        target = _evaluate_ast_node(node.value, context)
+        key = _evaluate_ast_node(node.slice, context)
+        try:
+            return target[key]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"Missing field '{key}' in condition expression.") from exc
+
+    if isinstance(node, ast.BoolOp):
+        values = [_evaluate_ast_node(value_node, context) for value_node in node.values]
+        if isinstance(node.op, ast.And):
+            return all(bool(value) for value in values)
+        if isinstance(node.op, ast.Or):
+            return any(bool(value) for value in values)
+        raise RuntimeError("Unsupported boolean operator in condition expression.")
+
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return not bool(_evaluate_ast_node(node.operand, context))
+
+    if isinstance(node, ast.BinOp):
+        left = _evaluate_ast_node(node.left, context)
+        right = _evaluate_ast_node(node.right, context)
+        return _apply_binary_operator(node.op, left, right)
+
+    if isinstance(node, ast.Compare):
+        left = _evaluate_ast_node(node.left, context)
+        for operator, comparator in zip(node.ops, node.comparators):
+            right = _evaluate_ast_node(comparator, context)
+            if not _apply_comparison_operator(operator, left, right):
+                return False
+            left = right
+        return True
+
+    if isinstance(node, ast.List):
+        return [_evaluate_ast_node(item, context) for item in node.elts]
+
+    if isinstance(node, ast.Tuple):
+        return tuple(_evaluate_ast_node(item, context) for item in node.elts)
+
+    raise RuntimeError(f"Unsupported expression construct: {node.__class__.__name__}.")
+
+
+def _apply_binary_operator(operator: ast.operator, left: Any, right: Any) -> Any:
+    try:
+        if isinstance(operator, ast.Add):
+            return left + right
+        if isinstance(operator, ast.Sub):
+            return left - right
+        if isinstance(operator, ast.Mult):
+            return left * right
+        if isinstance(operator, ast.Div):
+            return left / right
+        if isinstance(operator, ast.Mod):
+            return left % right
+    except TypeError as exc:
+        raise RuntimeError("Type mismatch while evaluating condition expression.") from exc
+
+    raise RuntimeError("Unsupported binary operator in condition expression.")
+
+
+def _apply_comparison_operator(operator: ast.cmpop, left: Any, right: Any) -> bool:
+    try:
+        if isinstance(operator, ast.Eq):
+            return left == right
+        if isinstance(operator, ast.NotEq):
+            return left != right
+        if isinstance(operator, ast.Gt):
+            return left > right
+        if isinstance(operator, ast.GtE):
+            return left >= right
+        if isinstance(operator, ast.Lt):
+            return left < right
+        if isinstance(operator, ast.LtE):
+            return left <= right
+        if isinstance(operator, ast.In):
+            return left in right
+        if isinstance(operator, ast.NotIn):
+            return left not in right
+    except TypeError as exc:
+        raise RuntimeError("Type mismatch while evaluating condition expression.") from exc
+
+    raise RuntimeError("Unsupported comparison operator in condition expression.")
+
+
+def _normalize_condition_result(result: Any) -> str:
+    if isinstance(result, bool):
+        return "true" if result else "false"
+    if result is None:
+        return "null"
+    if isinstance(result, (int, float)) and not isinstance(result, bool):
+        return str(result)
+    if isinstance(result, str):
+        cleaned = result.strip()
+        if cleaned:
+            return cleaned
+        raise RuntimeError("Condition expression returned an empty string branch key.")
+    raise RuntimeError(f"Condition expression returned unsupported type '{type(result).__name__}'.")
+
+
+def _set_condition_branch(parsed_data: dict[str, Any], node_id: str, branch: str) -> None:
+    condition_branches = parsed_data.get("__condition_branches__", {})
+    if not isinstance(condition_branches, dict):
+        condition_branches = {}
+    condition_branches[node_id] = branch
+    parsed_data["__condition_branches__"] = condition_branches
+
+
+def _record_condition_error(parsed_data: dict[str, Any], node_id: str, message: str) -> None:
+    condition_errors = parsed_data.get("__condition_errors__", {})
+    if not isinstance(condition_errors, dict):
+        condition_errors = {}
+    condition_errors[node_id] = message
+    parsed_data["__condition_errors__"] = condition_errors
+
+
 def _touch_iteration(state: SubAgentState) -> SubAgentState:
-    next_state = dict(state)
-    next_state["iteration_count"] = int(next_state.get("iteration_count", 0)) + 1
+    next_state = cast(SubAgentState, dict(state))
+    raw_count = next_state.get("iteration_count", 0)
+    try:
+        current_count = int(cast(Any, raw_count))
+    except (TypeError, ValueError):
+        current_count = 0
+
+    next_state["iteration_count"] = current_count + 1
     return next_state
 
 
@@ -434,7 +609,7 @@ def _handle_structured_parser_failure(
     parsed_data["__parser_errors__"] = parser_errors
     _set_parser_status(parsed_data, node.id, "failure")
 
-    next_state = dict(state)
+    next_state = cast(SubAgentState, dict(state))
     next_state["parsed_data"] = parsed_data
     return next_state
 
@@ -473,7 +648,20 @@ def _run_async(coro):
 
 def _execute_condition(node: AgentNode, state: SubAgentState) -> SubAgentState:
     assert isinstance(node, ConditionNode)
-    return _touch_iteration(state)
+    next_state = _touch_iteration(state)
+    parsed_data = next_state.get("parsed_data", {})
+    normalized_parsed_data = dict(parsed_data) if isinstance(parsed_data, dict) else {}
+
+    try:
+        selected_branch = _evaluate_condition_branch(node, next_state)
+    except RuntimeError as exc:
+        selected_branch = "default"
+        _record_condition_error(normalized_parsed_data, node.id, str(exc))
+
+    # Persist branch decisions in state so routing remains deterministic and observable.
+    _set_condition_branch(normalized_parsed_data, node.id, selected_branch)
+    next_state["parsed_data"] = normalized_parsed_data
+    return next_state
 
 
 def _execute_service_call(node: AgentNode, state: SubAgentState) -> SubAgentState:
