@@ -72,6 +72,7 @@ app/
 │   ├── agents.py
 │   ├── conversations.py
 │   ├── chat.py
+│   ├── configuration.py
 │   ├── documents.py
 │   └── tools.py
 ├── vector_store.py
@@ -242,6 +243,27 @@ Endpoints:
         - disabling the last active version is rejected with HTTP 400
 - DELETE /agents/{name}
     - Deletes all versions for that template name.
+
+## Platform configuration API
+
+The backend now exposes editable platform guardrails that can be updated without redeploying.
+
+Endpoints:
+
+- GET /configuration
+    - Returns the singleton platform configuration row.
+    - Creates the default row on first read if it does not exist.
+- PUT /configuration
+    - Updates guidelines and guardrails:
+        - guidelines_text
+        - banned_topics
+        - judge_enabled
+        - max_retries
+
+Validation:
+
+- `max_retries` must be greater than or equal to 0.
+- `guidelines_text` is capped at 8000 characters.
 
 All endpoints require an authenticated active user.
 
