@@ -37,6 +37,7 @@ from app.auth.users import current_active_user
 from app.config import settings
 from app.db.base import get_async_session
 from app.db.models import AgentTemplate, PlatformConfig, User
+from app.llm.client import LLMClientError, generate_text
 
 router = APIRouter()
 _RUN_REGISTRY_LOCK = threading.Lock()
@@ -122,6 +123,29 @@ class AgentAuthoringValidateResponse(BaseModel):
     is_valid: bool
     normalized_template: dict[str, Any] | None = None
     errors: list[AgentAuthoringValidationError] = Field(default_factory=list)
+
+
+class AgentAuthoringGenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(min_length=1, max_length=12000)
+    current_template: dict[str, Any] | None = None
+
+    @field_validator("prompt")
+    @classmethod
+    def trim_prompt(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("Prompt cannot be empty")
+        return trimmed
+
+
+class AgentAuthoringGenerateResponse(BaseModel):
+    message: str = Field(min_length=1)
+    generated_template: dict[str, Any] | None = None
+    is_valid: bool
+    errors: list[AgentAuthoringValidationError] = Field(default_factory=list)
+    referenced_nodes: list[str] = Field(default_factory=list)
 
 
 class AgentAuthoringSchemaField(BaseModel):
@@ -331,6 +355,49 @@ def _build_authoring_schema_catalog() -> AgentAuthoringSchemaResponse:
         guardrails_fields=_build_model_field_catalog(Guardrails),
         node_types=node_types,
     )
+
+
+def _build_authoring_generation_system_prompt(current_template: dict[str, Any] | None) -> str:
+    schema_catalog = _build_authoring_schema_catalog().model_dump(mode="json")
+    current_template_json = json.dumps(current_template, ensure_ascii=True) if current_template else "null"
+    schema_json = json.dumps(schema_catalog, ensure_ascii=True)
+    return (
+        "You convert a user's workflow description into a Cents AgentTemplate JSON object. "
+        "Return JSON only with exactly two top-level fields: message and template. "
+        "message is a short summary of the changes. template is the complete resulting template.\n\n"
+        "Authoring symbols:\n"
+        "- @node_id refers to an existing component with that id. Preserve and modify it when requested.\n"
+        "- #last_message, #parsed_data, and #service_results refer to runtime data. Convert them to valid "
+        "template keys or {{ ... }} placeholders as appropriate.\n"
+        "- /listen, /if, /call, /ask, /think, and /reply request structured_parser, condition, "
+        "service_call, user_interrupt, llm_step, and terminal_response components respectively.\n"
+        "Use concise stable node ids. Every non-terminal path must reach a terminal_response. "
+        "Condition nodes must include a default branch. Preserve unrelated parts of the current template.\n\n"
+        f"Current template:\n{current_template_json}\n\n"
+        f"Authoring schema catalog:\n{schema_json}"
+    )
+
+
+def _extract_authoring_generation_payload(text: str) -> dict[str, Any]:
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, count=1, flags=re.IGNORECASE)
+        candidate = re.sub(r"\s*```$", "", candidate, count=1)
+
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        object_start = candidate.find("{")
+        if object_start < 0:
+            raise ValueError("LLM response did not contain a JSON object.") from None
+        try:
+            parsed, _ = json.JSONDecoder().raw_decode(candidate[object_start:])
+        except json.JSONDecodeError as exc:
+            raise ValueError("LLM response contained invalid JSON.") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM response must be a JSON object.")
+    return parsed
 
 
 def _build_node_index_lookup(raw_template: Any) -> dict[int, str]:
@@ -928,6 +995,64 @@ async def get_authoring_schema(
 ):
     del user
     return _build_authoring_schema_catalog()
+
+
+@router.post("/authoring/generate", response_model=AgentAuthoringGenerateResponse)
+async def generate_authoring_template(
+    payload: AgentAuthoringGenerateRequest,
+    user: Annotated[User, Depends(current_active_user)],
+):
+    referenced_nodes = sorted(set(re.findall(r"@([A-Za-z][A-Za-z0-9_-]*)", payload.prompt)))
+    request_payload: dict[str, Any] = {
+        "messages": [{"role": "user", "content": payload.prompt}],
+        "system_prompt": _build_authoring_generation_system_prompt(payload.current_template),
+        "model_folder": settings.llm_default_generation_model_type,
+        "temperature": 0.1,
+        "max_tokens": 4096,
+        "metadata": {
+            "user_id": str(user.id),
+            "node": "agent_authoring",
+        },
+    }
+    if settings.llm_default_generation_model.strip():
+        request_payload["model"] = settings.llm_default_generation_model.strip()
+
+    try:
+        llm_response = await generate_text(request_payload)
+    except LLMClientError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    generated_text = str(llm_response.get("text", "")).strip()
+    if not generated_text:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="LLM service returned an empty response.")
+
+    try:
+        generated_payload = _extract_authoring_generation_payload(generated_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    generated_template = generated_payload.get("template")
+    if not isinstance(generated_template, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="LLM response is missing a template object.",
+        )
+
+    validation_result = validate_template(generated_template)  # type: ignore[arg-type]
+    normalized_template = _normalize_template_if_parseable(generated_template, validation_result)
+    structured_errors = _build_structured_validation_errors(generated_template, validation_result.errors)
+    raw_message = generated_payload.get("message")
+    message = str(raw_message).strip() if raw_message is not None else ""
+    if not message:
+        message = "Generated a workflow draft from your description."
+
+    return AgentAuthoringGenerateResponse(
+        message=message,
+        generated_template=normalized_template or generated_template,
+        is_valid=validation_result.is_valid,
+        errors=structured_errors,
+        referenced_nodes=referenced_nodes,
+    )
 
 
 @router.post("/authoring/validate", response_model=AgentAuthoringValidateResponse)

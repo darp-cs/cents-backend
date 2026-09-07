@@ -15,7 +15,9 @@ from app.auth.users import current_active_user
 from app.db.base import AsyncSessionLocal, init_db
 from app.db.models import AgentTemplate
 from app.routes.agents import (
+    AgentAuthoringGenerateRequest,
     AgentAuthoringValidateRequest,
+    generate_authoring_template,
     get_authoring_schema,
     router,
     validate_authoring_template,
@@ -221,6 +223,46 @@ def test_authoring_validate_does_not_write_or_compile(monkeypatch) -> None:
             row = persisted.scalar_one()
             assert row.version == 1
             assert row.enabled is True
+
+    _run(_test())
+
+
+def test_authoring_generate_uses_symbols_and_returns_validated_template(monkeypatch) -> None:
+    async def _test() -> None:
+        captured_payload: dict[str, Any] = {}
+
+        async def _fake_generate_text(payload: dict[str, Any]) -> dict[str, Any]:
+            captured_payload.update(payload)
+            return {
+                "text": json.dumps(
+                    {
+                        "message": "Updated the parser and added a conditional route.",
+                        "template": _valid_template(),
+                    }
+                )
+            }
+
+        monkeypatch.setattr("app.routes.agents.generate_text", _fake_generate_text)
+
+        response = await generate_authoring_template(
+            payload=AgentAuthoringGenerateRequest(
+                prompt="Update @parse_request using #last_message, then /if amount is high and /reply.",
+                current_template=_valid_template(),
+            ),
+            user=_fake_user(),
+        )
+
+        assert response.is_valid is True
+        assert response.generated_template is not None
+        assert response.generated_template["entry_node"] == "parse_request"
+        assert response.referenced_nodes == ["parse_request"]
+        assert response.message == "Updated the parser and added a conditional route."
+
+        assert captured_payload["model_folder"]
+        assert captured_payload["temperature"] == 0.1
+        assert "@node_id" in captured_payload["system_prompt"]
+        assert "/if" in captured_payload["system_prompt"]
+        assert captured_payload["messages"][0]["content"].startswith("Update @parse_request")
 
     _run(_test())
 
