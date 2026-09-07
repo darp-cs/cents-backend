@@ -42,8 +42,9 @@ flowchart LR
 - JWT auth via local auth routes and bcrypt password hashing
 - Conversation CRUD (user-scoped)
 - SSE chat endpoint backed by LangGraph orchestration
-- Document ingestion into SQLite + Chroma
-- Tool registration into SQLite + Chroma
+- Document ingestion into SQLite + Chroma with embedding-backed vector indexing
+- Tool management (create/update/enable/disable/delete) in SQLite + Chroma with enabled-only retrieval
+- Hybrid sub-agent routing that uses agent descriptions for semantic selection (name match, embedding rank, lexical fallback)
 
 ## Project structure
 
@@ -94,6 +95,29 @@ If you are new to the codebase, read in this order:
 4. `app/graph/*.py`: per-node behavior (routing, retrieval, generation, judging).
 5. `app/db/models.py` and `app/vector_store.py`: relational vs vector persistence responsibilities.
 6. `app/config.py`: runtime settings and environment-driven behavior.
+
+## Main chat orchestration and routing policy
+
+The top-level chat graph in `app/graph/graph.py` routes through `orchestrator -> retrieval -> generation -> judge`.
+
+The orchestrator (`app/graph/orchestrator.py`) now applies a hybrid policy for sub-agent selection:
+
+1. Load enabled, valid agent templates from `agent_templates` and keep the latest version per agent name.
+2. Try direct name match against the user message.
+3. If no name match, rank candidates by embedding similarity of `"<agent name>. <agent description>"`.
+4. If embedding selection is unavailable, use lexical overlap fallback.
+5. Attempt a bounded number of ranked candidates; execute the first candidate that produces a terminal response.
+6. If no sub-agent is selected, fall back to deterministic top-level routing (`tools`, `docs`, `both`, `direct`).
+
+Selection metadata is persisted in graph state as `selected_agent` for observability (`name`, `version`, `description`, `selection_mode`, `selection_score`).
+
+### Retrieval behavior
+
+- Tool retrieval (`app/graph/retrieval_tools.py`) embeds the user query and filters vectors by `enabled=true`.
+- Document retrieval (`app/graph/retrieval_docs.py`) embeds the user query before vector search.
+- Document upload (`app/routes/documents.py`) now embeds chunk text during ingestion so document search is semantic, not placeholder-based.
+
+This follows a two-stage retrieval pattern: high-recall semantic candidate lookup first, then constrained downstream generation/judging.
 
 ## Agent workflow templates (schema-first)
 
@@ -157,7 +181,7 @@ Use `validate_template(raw_json)` to parse and validate templates. It checks:
 - Resuming with `Command(resume=<answer>)` continues from the interrupted node's `next` and merges the answer into `parsed_data[output_key]` plus `messages`.
 - `service_call` supports:
     - `mode=http`: configured `url` + `method`, with header/body template interpolation from state
-    - `mode=tool`: reference to a registered `ToolDefinition` by `tool_name` or `tool_id`
+    - `mode=tool`: reference to a registered `ToolDefinition` by `tool_name` or `tool_id`, with optional `tool_input_template`
 - `llm_step` supports a single scoped LLM call with explicit `model_type`, `temperature`, `max_tokens`, and templated `system_prompt`.
 - `llm_step` `system_prompt` placeholders are limited to `parsed_data.*` and `service_results.*` to prevent implicit full-state prompt injection.
 - `llm_step` writes generated text to `messages` and can optionally persist to `parsed_data[output_key]`.
@@ -165,6 +189,7 @@ Use `validate_template(raw_json)` to parse and validate templates. It checks:
 - HTTP service calls are SSRF-protected via `SERVICE_CALL_ALLOWED_HOSTS` unless unsafe destinations are explicitly enabled server-side.
 - Sensitive headers/body fields must reference server-side secrets using placeholders (for example `{{ secret.my_api_key }}`), never hardcoded values in templates.
 - Service call responses are stored at `service_results[node_id]`.
+- Tool-mode service calls first use a registered in-process executor when present; otherwise they execute persisted tool `python_code` via the configured entrypoint.
 - Non-2xx responses and timeouts route to `on_failure` when configured; otherwise they raise a clear runtime error.
 - Compiled graphs are cached per `(name, version)` for reuse.
 
@@ -246,7 +271,7 @@ Endpoints:
 
 ### Agent authoring metadata and dry-run validation
 
-These endpoints support editor experiences (JSON and visual) without creating temporary database rows.
+These endpoints support natural-language, visual, and JSON editor experiences without creating temporary database rows.
 
 Endpoints:
 
@@ -260,6 +285,38 @@ Endpoints:
         - `normalized_template` when the payload is parseable
         - structured `errors` with `path`, optional `node_id`, and `message`
     - Does not create, update, delete, compile, or enable `AgentTemplate` records.
+- POST /agents/authoring/generate
+    - Accepts a complete natural-language workflow source and an optional current template.
+    - Supplies the live schema catalog to the configured generation model.
+    - Requires a complete `{ "message": ..., "template": ... }` JSON response.
+    - Validates the generated template before returning it to the editor; invalid output is returned with structured errors and is not applied by the frontend.
+    - Reports explicit `@node_id` references while excluding reserved authoring directives.
+
+### Natural-language authoring contract
+
+The authoring notation is intentionally line-oriented and indentation-friendly. It is an authoring layer only: the validated `AgentTemplate` remains the executable and persisted representation.
+
+| Directive | Canonical capability |
+| --- | --- |
+| `@start <instruction>` | Select or describe the entry step. |
+| `@listen <fields and source>` | Create a `structured_parser`, including field types and regex or LLM extraction when stated. |
+| `@if <condition>` | Create a `condition` and its matching branch. |
+| `@else if <condition>` | Add another named condition branch. |
+| `@else` | Add the required default branch. |
+| `@call <HTTP request or tool>` | Create an HTTP-mode or tool-mode `service_call`; tool mode must include `tool_name` or `tool_id` and can include `tool_input_template`. |
+| `@interrupt <request>` | Create a checkpointed `user_interrupt`, including answer type, choices, and output key when stated. |
+| `@think <instruction>` | Create an `llm_step`, including model options and output key when stated. |
+| `@reply <response>` | Create a success, failure, or cancelled `terminal_response`. |
+| `@on_failure <instruction>` | Attach an error route to the preceding parser, service call, or LLM step. |
+| `@guardrails <policy>` | Set maximum iterations, banned topics, and judge overrides. |
+
+Plain text may be used between directives. Indentation associates text with the nearest directive, and document order provides the default sequence. Explicit component references use `@node_id`; directive names are reserved and are not treated as component IDs.
+
+Graph-state references use `{{ state.<path> }}` in authoring source. The generator maps them to the subset supported by the target node schema. Runtime data currently includes `input`, `parsed_data`, `messages`, and `service_results`; individual node types deliberately expose narrower subsets. For example, conditions evaluate `parsed_data` and `service_results`, while terminal responses may also render `messages`.
+
+The generation model is not trusted as the execution boundary. Pydantic parsing, graph reachability checks, terminal-path checks, safe condition evaluation, scoped placeholder resolution, and service-call protections remain authoritative after generation.
+
+This design follows the same separation used by readable specification formats such as [Gherkin](https://cucumber.io/docs/gherkin/reference/): concise structural keywords for authors, followed by deterministic validation. Interrupt behavior maps directly to [LangGraph interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts), including checkpointed pause and resume.
 
 ### Sub-agent run streaming
 

@@ -55,9 +55,19 @@ def zero_embedding() -> list[float]:
     return [0.0 for _ in range(settings.vector_dimension)]
 
 
-def upsert_documents(user_id: str, source_filename: str, items: list[tuple[str, str]]):
+def upsert_documents(
+    user_id: str,
+    source_filename: str,
+    items: list[tuple[str, str]],
+    *,
+    embeddings: list[list[float]] | None = None,
+):
     collection = get_documents_collection()
-    embeddings = [zero_embedding() for _ in items]
+    if embeddings is None:
+        embeddings = [zero_embedding() for _ in items]
+    elif len(embeddings) != len(items):
+        raise ValueError("Document embedding count does not match the number of items.")
+
     ids = [item_id for item_id, _ in items]
     documents = [chunk_text for _, chunk_text in items]
     metadatas = [
@@ -102,14 +112,42 @@ def upsert_tool(tool_id: str, name: str, description: str):
     collection.upsert(
         ids=[tool_id],
         documents=[description],
-        metadatas=[{"name": name}],
+        metadatas=[{"name": name, "enabled": True}],
         embeddings=[zero_embedding()],
     )
 
 
-def query_tools(query_embedding: list[float], limit: int = 5) -> list[dict]:
+def upsert_tool_embedding(
+    tool_id: str,
+    *,
+    name: str,
+    description: str,
+    embedding: list[float],
+    enabled: bool,
+) -> None:
     collection = get_tools_collection()
-    result = collection.query(query_embeddings=[query_embedding], n_results=limit)
+    collection.upsert(
+        ids=[tool_id],
+        documents=[description],
+        metadatas=[{"name": name, "enabled": bool(enabled)}],
+        embeddings=[embedding],
+    )
+
+
+def delete_tool(tool_id: str) -> None:
+    collection = get_tools_collection()
+    collection.delete(ids=[tool_id])
+
+
+def query_tools(query_embedding: list[float], limit: int = 5, *, enabled_only: bool = True) -> list[dict]:
+    collection = get_tools_collection()
+    query_kwargs = {
+        "query_embeddings": [query_embedding],
+        "n_results": limit,
+    }
+    if enabled_only:
+        query_kwargs["where"] = {"enabled": True}
+    result = collection.query(**query_kwargs)
 
     docs = result.get("documents", [[]])[0]
     metas = result.get("metadatas", [[]])[0]
@@ -124,6 +162,7 @@ def query_tools(query_embedding: list[float], limit: int = 5) -> list[dict]:
                 "id": tool_id,
                 "name": (metadata or {}).get("name", "unknown"),
                 "description": description,
+                "enabled": bool((metadata or {}).get("enabled", True)),
                 "similarity": similarity,
                 "source": "chroma",
             }

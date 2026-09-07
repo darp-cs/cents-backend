@@ -148,6 +148,22 @@ class AgentAuthoringGenerateResponse(BaseModel):
     referenced_nodes: list[str] = Field(default_factory=list)
 
 
+class AgentAuthoringNodeAssistRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_type: str = Field(min_length=1)
+    instruction: str = Field(min_length=1, max_length=4000)
+    current_node: dict[str, Any]
+    current_template: dict[str, Any] | None = None
+
+
+class AgentAuthoringNodeAssistResponse(BaseModel):
+    message: str = Field(min_length=1)
+    node: dict[str, Any] | None = None
+    is_valid: bool
+    errors: list[AgentAuthoringValidationError] = Field(default_factory=list)
+
+
 class AgentAuthoringSchemaField(BaseModel):
     name: str = Field(min_length=1)
     type: str = Field(min_length=1)
@@ -199,6 +215,39 @@ _NODE_PATH_ONLY_PATTERN = re.compile(
 )
 _DUPLICATE_NODE_PATTERN = re.compile(r"^Duplicate node id '([^']+)'\.$")
 _ENTRY_NODE_PATTERN = re.compile(r"^entry_node '[^']+' does not match any node id\.$")
+_AUTHORING_DIRECTIVES = frozenset(
+    {
+        "start",
+        "listen",
+        "if",
+        "else",
+        "call",
+        "interrupt",
+        "think",
+        "reply",
+        "on_failure",
+        "guardrails",
+    }
+)
+
+
+def _resolve_node_type_for_model(node_model: type[BaseModel]) -> str:
+    annotation = node_model.model_fields["type"].annotation
+    target = annotation
+    args = [arg for arg in get_args(target) if arg is not type(None)]
+    if len(args) == 1:
+        target = args[0]
+
+    type_options = list(get_args(target)) if get_origin(target) is Literal else []
+    if type_options:
+        return str(type_options[0])
+    type_schema = node_model.model_json_schema().get("properties", {}).get("type", {})
+    return str(type_schema.get("const") or node_model.__name__)
+
+
+_NODE_MODEL_BY_TYPE: dict[str, type[BaseModel]] = {
+    _resolve_node_type_for_model(node_model): node_model for node_model in _NODE_SCHEMA_MODELS
+}
 
 
 def _clear_agent_run_registry() -> None:
@@ -365,17 +414,126 @@ def _build_authoring_generation_system_prompt(current_template: dict[str, Any] |
         "You convert a user's workflow description into a Cents AgentTemplate JSON object. "
         "Return JSON only with exactly two top-level fields: message and template. "
         "message is a short summary of the changes. template is the complete resulting template.\n\n"
-        "Authoring symbols:\n"
-        "- @node_id refers to an existing component with that id. Preserve and modify it when requested.\n"
-        "- #last_message, #parsed_data, and #service_results refer to runtime data. Convert them to valid "
-        "template keys or {{ ... }} placeholders as appropriate.\n"
-        "- /listen, /if, /call, /ask, /think, and /reply request structured_parser, condition, "
-        "service_call, user_interrupt, llm_step, and terminal_response components respectively.\n"
+        "Readable workflow source conventions:\n"
+        "- Treat the document as a complete workflow definition. Preserve line order and use indentation to "
+        "associate statements with the nearest directive.\n"
+        "- Plain text describes the workflow title, steps, actions, and responses. Infer the smallest useful "
+        "set of components; do not add unrelated example components.\n"
+        "- '@start <instruction>' marks the entry step when document order alone is not sufficient.\n"
+        "- '@listen <fields and source>' creates a structured_parser. Infer field names, types, required flags, "
+        "and regex or LLM extraction strategy from the description.\n"
+        "- '@if <condition>' creates a condition component and begins its matching branch.\n"
+        "- '@else if <condition>' adds another named branch. '@else' begins the required default branch.\n"
+        "- '@call <HTTP request or tool name>' creates a service_call. Use HTTP mode for a method and URL, "
+        "and tool mode when the description names a registered tool. Tool mode must include tool_name or tool_id "
+        "and should provide tool_input_template when inputs are described.\n"
+        "- '@interrupt <request>' creates a user_interrupt component that pauses for the requested input, "
+        "including output key, expected type, and choices when stated, then continues to the next step.\n"
+        "- '@think <instruction>' creates an llm_step. Capture model settings and output key when stated.\n"
+        "- '@reply <response>' creates a terminal_response with the requested success, failure, or cancelled status.\n"
+        "- '@on_failure <instruction>' attaches an error route to the preceding parser, service call, or LLM step.\n"
+        "- '@guardrails <policy>' configures maximum iterations, banned topics, and judge overrides.\n"
+        "- '{{ state.<path> }}' refers to graph state. Supported runtime roots are input, parsed_data, messages, "
+        "and service_results; map each reference to the subset allowed by the target node schema and do not invent fields.\n"
+        "- '@node_id' refers to an existing component only when the token is not a reserved directive. "
+        "Preserve and modify that component when requested.\n"
+        "Legacy #last_message, #parsed_data, #service_results, /listen, /if, /call, /ask, /think, and /reply "
+        "symbols may still be accepted.\n"
         "Use concise stable node ids. Every non-terminal path must reach a terminal_response. "
         "Condition nodes must include a default branch. Preserve unrelated parts of the current template.\n\n"
         f"Current template:\n{current_template_json}\n\n"
         f"Authoring schema catalog:\n{schema_json}"
     )
+
+
+def _build_node_assist_system_prompt(
+    *,
+    node_type: str,
+    current_node: dict[str, Any],
+    current_template: dict[str, Any] | None,
+) -> str:
+    schema_catalog = _build_authoring_schema_catalog().model_dump(mode="json")
+    target_schema = next((item for item in schema_catalog["node_types"] if item["type"] == node_type), None)
+    current_node_json = json.dumps(current_node, ensure_ascii=True)
+    current_template_json = json.dumps(current_template, ensure_ascii=True) if current_template else "null"
+    target_schema_json = json.dumps(target_schema or {}, ensure_ascii=True)
+
+    return (
+        "You help edit exactly one workflow node in Cents based on a natural-language instruction. "
+        "Return JSON only with exactly two top-level fields: message and node. "
+        "message is one short sentence. node is the fully-populated updated node object.\n\n"
+        "Rules:\n"
+        "- Keep node.id unchanged.\n"
+        "- Keep node.type unchanged and equal to the requested node_type.\n"
+        "- Preserve routing fields unless the instruction explicitly asks to change them.\n"
+        "- Favor deterministic config values that can be validated server-side.\n"
+        "- For condition nodes: convert natural language into config.expression and config.input_keys. "
+        "Use plain deterministic expression syntax, not prose.\n"
+        "- For service_call nodes: use mode='tool' when a registered tool is requested (set tool_name/tool_id and "
+        "tool_input_template), otherwise use mode='http' with method/url plus headers/body templates.\n"
+        "- Do not include markdown fences or explanatory prose outside the JSON object.\n\n"
+        f"Requested node_type:\n{node_type}\n\n"
+        f"Current node:\n{current_node_json}\n\n"
+        f"Current template (for context only):\n{current_template_json}\n\n"
+        f"Target node schema:\n{target_schema_json}"
+    )
+
+
+def _normalize_node_type(value: str) -> str:
+    return value.strip()
+
+
+def _merge_assisted_node(
+    current_node: dict[str, Any],
+    assisted_node: dict[str, Any],
+    expected_node_type: str,
+) -> dict[str, Any]:
+    merged = dict(current_node)
+
+    if "description" in assisted_node:
+        merged["description"] = assisted_node.get("description")
+
+    if isinstance(assisted_node.get("config"), dict):
+        merged["config"] = assisted_node["config"]
+
+    for transition_field in ("next", "on_failure", "branches"):
+        if transition_field in assisted_node:
+            merged[transition_field] = assisted_node[transition_field]
+
+    merged["id"] = str(current_node.get("id", "")).strip()
+    merged["type"] = expected_node_type
+    return merged
+
+
+def _validate_assisted_node(
+    *,
+    node_type: str,
+    node_payload: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[AgentAuthoringValidationError]]:
+    node_model = _NODE_MODEL_BY_TYPE.get(node_type)
+    if node_model is None:
+        return None, [
+            AgentAuthoringValidationError(
+                path="node.type",
+                node_id=None,
+                message=f"Unsupported node_type '{node_type}'.",
+            )
+        ]
+
+    try:
+        normalized = node_model.model_validate(node_payload).model_dump(mode="json")
+        return normalized, []
+    except ValidationError as exc:
+        node_id = str(node_payload.get("id", "")).strip() or None
+        errors = [
+            AgentAuthoringValidationError(
+                path="node." + ".".join(str(part) for part in issue["loc"]),
+                node_id=node_id,
+                message=issue["msg"],
+            )
+            for issue in exc.errors()
+        ]
+        return None, errors
 
 
 def _extract_authoring_generation_payload(text: str) -> dict[str, Any]:
@@ -1002,7 +1160,13 @@ async def generate_authoring_template(
     payload: AgentAuthoringGenerateRequest,
     user: Annotated[User, Depends(current_active_user)],
 ):
-    referenced_nodes = sorted(set(re.findall(r"@([A-Za-z][A-Za-z0-9_-]*)", payload.prompt)))
+    referenced_nodes = sorted(
+        {
+            reference
+            for reference in re.findall(r"@([A-Za-z][A-Za-z0-9_-]*)", payload.prompt)
+            if reference.lower() not in _AUTHORING_DIRECTIVES
+        }
+    )
     request_payload: dict[str, Any] = {
         "messages": [{"role": "user", "content": payload.prompt}],
         "system_prompt": _build_authoring_generation_system_prompt(payload.current_template),
@@ -1052,6 +1216,107 @@ async def generate_authoring_template(
         is_valid=validation_result.is_valid,
         errors=structured_errors,
         referenced_nodes=referenced_nodes,
+    )
+
+
+@router.post("/authoring/node-assist", response_model=AgentAuthoringNodeAssistResponse)
+async def assist_authoring_node(
+    payload: AgentAuthoringNodeAssistRequest,
+    user: Annotated[User, Depends(current_active_user)],
+):
+    normalized_node_type = _normalize_node_type(payload.node_type)
+    current_node_type = _normalize_node_type(str(payload.current_node.get("type", "")))
+    current_node_id = str(payload.current_node.get("id", "")).strip() or None
+
+    if normalized_node_type not in _NODE_MODEL_BY_TYPE:
+        return AgentAuthoringNodeAssistResponse(
+            message="Node assist could not be generated.",
+            node=None,
+            is_valid=False,
+            errors=[
+                AgentAuthoringValidationError(
+                    path="node_type",
+                    node_id=current_node_id,
+                    message=f"Unsupported node_type '{normalized_node_type}'.",
+                )
+            ],
+        )
+
+    if current_node_type != normalized_node_type:
+        return AgentAuthoringNodeAssistResponse(
+            message="Node assist could not be generated.",
+            node=None,
+            is_valid=False,
+            errors=[
+                AgentAuthoringValidationError(
+                    path="current_node.type",
+                    node_id=current_node_id,
+                    message="current_node.type must match node_type.",
+                )
+            ],
+        )
+
+    request_payload: dict[str, Any] = {
+        "messages": [{"role": "user", "content": payload.instruction}],
+        "system_prompt": _build_node_assist_system_prompt(
+            node_type=normalized_node_type,
+            current_node=payload.current_node,
+            current_template=payload.current_template,
+        ),
+        "model_folder": settings.llm_default_generation_model_type,
+        "temperature": 0.1,
+        "max_tokens": 2048,
+        "metadata": {
+            "user_id": str(user.id),
+            "node": "agent_authoring_node_assist",
+            "node_type": normalized_node_type,
+        },
+    }
+    if settings.llm_default_generation_model.strip():
+        request_payload["model"] = settings.llm_default_generation_model.strip()
+
+    try:
+        llm_response = await generate_text(request_payload)
+    except LLMClientError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    generated_text = str(llm_response.get("text", "")).strip()
+    if not generated_text:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="LLM service returned an empty response.")
+
+    try:
+        generated_payload = _extract_authoring_generation_payload(generated_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    assisted_node = generated_payload.get("node")
+    if not isinstance(assisted_node, dict):
+        return AgentAuthoringNodeAssistResponse(
+            message="Node assist could not be generated.",
+            node=None,
+            is_valid=False,
+            errors=[
+                AgentAuthoringValidationError(
+                    path="node",
+                    node_id=current_node_id,
+                    message="LLM response is missing a node object.",
+                )
+            ],
+        )
+
+    merged_node = _merge_assisted_node(payload.current_node, assisted_node, normalized_node_type)
+    normalized_node, errors = _validate_assisted_node(node_type=normalized_node_type, node_payload=merged_node)
+
+    raw_message = generated_payload.get("message")
+    message = str(raw_message).strip() if raw_message is not None else ""
+    if not message:
+        message = "Generated node draft from natural language."
+
+    return AgentAuthoringNodeAssistResponse(
+        message=message,
+        node=normalized_node,
+        is_valid=normalized_node is not None,
+        errors=errors,
     )
 
 

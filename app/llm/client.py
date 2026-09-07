@@ -124,3 +124,72 @@ async def list_models_payload() -> dict[str, Any]:
         "models": [str(model).strip() for model in models if str(model).strip()],
         "folders": _normalize_model_folders(payload.get("folders", {})),
     }
+
+
+async def embed_texts(
+    texts: list[str],
+    *,
+    model_folder: str | None = None,
+    model: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> list[list[float]]:
+    normalized_texts = [text for text in (item.strip() for item in texts) if text]
+    if not normalized_texts:
+        return []
+
+    request_payload: dict[str, Any] = {
+        "input": normalized_texts,
+    }
+    resolved_model_folder = (model_folder or settings.llm_default_embedding_model_type).strip()
+    if not resolved_model_folder:
+        raise LLMClientError("No embedding model folder is configured.")
+    request_payload["model_folder"] = resolved_model_folder
+
+    resolved_model = (model or settings.llm_default_embedding_model).strip()
+    if resolved_model:
+        request_payload["model"] = resolved_model
+    if metadata:
+        request_payload["metadata"] = metadata
+
+    timeout = httpx.Timeout(timeout=settings.llm_service_timeout_seconds)
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                _build_endpoint(settings.llm_service_embeddings_path),
+                json=request_payload,
+                headers=_build_headers(),
+            )
+    except httpx.TimeoutException as exc:
+        raise LLMClientError("LLM embeddings request timed out.") from exc
+    except httpx.RequestError as exc:
+        raise LLMClientError(f"LLM service connection failed: {exc}") from exc
+
+    if response.status_code >= 400:
+        detail = _extract_error_detail(response)
+        raise LLMClientError(f"LLM embeddings request failed ({response.status_code}): {detail}")
+
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise LLMClientError("LLM embeddings response payload is invalid.")
+
+    vectors = payload.get("embeddings")
+    if not isinstance(vectors, list):
+        raise LLMClientError("LLM embeddings response is missing embeddings.")
+
+    normalized_vectors: list[list[float]] = []
+    for index, vector in enumerate(vectors):
+        if not isinstance(vector, list):
+            raise LLMClientError(f"LLM embeddings item {index} is invalid.")
+        try:
+            normalized_vector = [float(value) for value in vector]
+        except (TypeError, ValueError) as exc:
+            raise LLMClientError(f"LLM embeddings item {index} contains non-numeric values.") from exc
+        if not normalized_vector:
+            raise LLMClientError(f"LLM embeddings item {index} is empty.")
+        normalized_vectors.append(normalized_vector)
+
+    if len(normalized_vectors) != len(normalized_texts):
+        raise LLMClientError("LLM embeddings response size does not match inputs.")
+
+    return normalized_vectors

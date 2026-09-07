@@ -6,6 +6,14 @@ class NodeLLMConfig(TypedDict, total=False):
     model: str | None
 
 
+class SelectedAgent(TypedDict, total=False):
+    name: str
+    version: int
+    description: str
+    selection_mode: str
+    selection_score: float
+
+
 class GraphState(TypedDict, total=False):
     messages: list[dict[str, Any]]
     user_id: str
@@ -17,3 +25,4 @@ class GraphState(TypedDict, total=False):
     judge_verdict: dict[str, Any] | None
     next_route: str
     generated_response: str
+    selected_agent: SelectedAgent

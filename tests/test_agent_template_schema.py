@@ -119,6 +119,55 @@ def test_guardrails_default_when_omitted(valid_template: dict) -> None:
     assert result.template.guardrails.judge_enabled_override is None
 
 
+def test_canvas_layout_is_accepted_when_node_ids_match(valid_template: dict) -> None:
+    template = copy.deepcopy(valid_template)
+    template["canvas_layout"] = {
+        "node_positions": {
+            "parse_request": {"x": 220, "y": 70},
+            "check_amount": {"x": 220, "y": 250},
+            "respond": {"x": 220, "y": 430},
+        },
+        "viewport": {"x": 0, "y": 0, "zoom": 1},
+    }
+
+    result = validate_template(template)
+
+    assert result.is_valid
+    assert result.template is not None
+    assert result.template.canvas_layout is not None
+    assert "parse_request" in result.template.canvas_layout.node_positions
+
+
+def test_canvas_layout_rejects_unknown_node_ids(valid_template: dict) -> None:
+    template = copy.deepcopy(valid_template)
+    template["canvas_layout"] = {
+        "node_positions": {
+            "missing_node": {"x": 120, "y": 80},
+        }
+    }
+
+    result = validate_template(template)
+
+    assert not result.is_valid
+    assert result.errors == [
+        "canvas_layout.node_positions['missing_node'] points to unknown node id 'missing_node'."
+    ]
+
+
+def test_canvas_layout_rejects_invalid_node_position_keys(valid_template: dict) -> None:
+    template = copy.deepcopy(valid_template)
+    template["canvas_layout"] = {
+        "node_positions": {
+            "1-invalid": {"x": 120, "y": 80},
+        }
+    }
+
+    result = validate_template(template)
+
+    assert not result.is_valid
+    assert any("canvas_layout.node_positions" in error for error in result.errors)
+
+
 def test_dangling_edge_is_rejected(valid_template: dict) -> None:
     template = copy.deepcopy(valid_template)
     template["nodes"][3]["next"] = "does_not_exist"

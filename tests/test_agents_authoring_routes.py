@@ -16,7 +16,9 @@ from app.db.base import AsyncSessionLocal, init_db
 from app.db.models import AgentTemplate
 from app.routes.agents import (
     AgentAuthoringGenerateRequest,
+    AgentAuthoringNodeAssistRequest,
     AgentAuthoringValidateRequest,
+    assist_authoring_node,
     generate_authoring_template,
     get_authoring_schema,
     router,
@@ -246,7 +248,19 @@ def test_authoring_generate_uses_symbols_and_returns_validated_template(monkeypa
 
         response = await generate_authoring_template(
             payload=AgentAuthoringGenerateRequest(
-                prompt="Update @parse_request using #last_message, then /if amount is high and /reply.",
+                prompt=(
+                    "Credit Recommendations\n\n"
+                    "@start inspect the latest request\n"
+                    "@listen for account_id as text and amount as number\n"
+                    "@if the user is authenticated\n"
+                    "  @call tool credit_profile using {{ state.parsed_data.account_id }}\n"
+                    "  @think recommend a credit product using {{ state.service_results.credit_profile }}\n"
+                    "@else\n"
+                    "  @reply ask the user to sign in\n"
+                    "@on_failure @parse_request\n"
+                    "  @interrupt the user to clarify if more information is needed\n"
+                    "@guardrails maximum iterations 4 and enable the judge"
+                ),
                 current_template=_valid_template(),
             ),
             user=_fake_user(),
@@ -261,8 +275,109 @@ def test_authoring_generate_uses_symbols_and_returns_validated_template(monkeypa
         assert captured_payload["model_folder"]
         assert captured_payload["temperature"] == 0.1
         assert "@node_id" in captured_payload["system_prompt"]
-        assert "/if" in captured_payload["system_prompt"]
-        assert captured_payload["messages"][0]["content"].startswith("Update @parse_request")
+        assert "@if <condition>" in captured_payload["system_prompt"]
+        assert "@else" in captured_payload["system_prompt"]
+        assert "@interrupt <request>" in captured_payload["system_prompt"]
+        assert "@listen <fields and source>" in captured_payload["system_prompt"]
+        assert "@call <HTTP request or tool name>" in captured_payload["system_prompt"]
+        assert "@think <instruction>" in captured_payload["system_prompt"]
+        assert "@reply <response>" in captured_payload["system_prompt"]
+        assert "@on_failure <instruction>" in captured_payload["system_prompt"]
+        assert "@guardrails <policy>" in captured_payload["system_prompt"]
+        assert "{{ state.<path> }}" in captured_payload["system_prompt"]
+        assert captured_payload["messages"][0]["content"].startswith("Credit Recommendations")
+
+    _run(_test())
+
+
+def test_authoring_node_assist_compiles_condition_from_natural_language(monkeypatch) -> None:
+    async def _test() -> None:
+        captured_payload: dict[str, Any] = {}
+
+        async def _fake_generate_text(payload: dict[str, Any]) -> dict[str, Any]:
+            captured_payload.update(payload)
+            return {
+                "text": json.dumps(
+                    {
+                        "message": "Updated decision rule.",
+                        "node": {
+                            "id": "check_amount",
+                            "type": "condition",
+                            "config": {
+                                "expression": "parsed_data.amount >= 500 and parsed_data.category == 'travel'",
+                                "input_keys": ["parsed_data.amount", "parsed_data.category"],
+                            },
+                            "branches": {
+                                "true": "confirm_with_user",
+                                "false": "call_ledger",
+                                "default": "call_ledger",
+                            },
+                        },
+                    }
+                )
+            }
+
+        monkeypatch.setattr("app.routes.agents.generate_text", _fake_generate_text)
+
+        template = _valid_template()
+        template["nodes"][0]["next"] = "check_amount"
+        template["nodes"][1] = {
+            "id": "check_amount",
+            "type": "condition",
+            "config": {
+                "expression": "parsed_data.amount > 1000",
+                "input_keys": ["parsed_data.amount"],
+            },
+            "branches": {
+                "true": "respond",
+                "default": "respond",
+            },
+        }
+
+        response = await assist_authoring_node(
+            payload=AgentAuthoringNodeAssistRequest(
+                node_type="condition",
+                instruction="If amount is at least five hundred and category is travel, take true branch.",
+                current_node=template["nodes"][1],
+                current_template=template,
+            ),
+            user=_fake_user(),
+        )
+
+        assert response.is_valid is True
+        assert response.node is not None
+        assert response.node["type"] == "condition"
+        assert response.node["config"]["expression"].startswith("parsed_data.amount >= 500")
+        assert response.node["config"]["input_keys"] == ["parsed_data.amount", "parsed_data.category"]
+        assert response.message == "Updated decision rule."
+
+        assert captured_payload["metadata"]["node"] == "agent_authoring_node_assist"
+        assert captured_payload["metadata"]["node_type"] == "condition"
+        assert "condition nodes" in captured_payload["system_prompt"].lower()
+
+    _run(_test())
+
+
+def test_authoring_node_assist_rejects_mismatched_node_type() -> None:
+    async def _test() -> None:
+        response = await assist_authoring_node(
+            payload=AgentAuthoringNodeAssistRequest(
+                node_type="condition",
+                instruction="Route to success when approved.",
+                current_node={
+                    "id": "respond",
+                    "type": "terminal_response",
+                    "config": {"template": "Done"},
+                },
+                current_template=_valid_template(),
+            ),
+            user=_fake_user(),
+        )
+
+        assert response.is_valid is False
+        assert response.node is None
+        assert response.errors
+        assert response.errors[0].path == "current_node.type"
 
     _run(_test())
 

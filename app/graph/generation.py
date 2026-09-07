@@ -46,6 +46,10 @@ def _resolve_generation_model_config(state: GraphState) -> tuple[str, str | None
 
 
 async def generation_node(state: GraphState) -> GraphState:
+    precomputed_response = str(state.get("generated_response", "")).strip()
+    if precomputed_response:
+        return state
+
     messages = list(state.get("messages", []))
     retrieved_docs = state.get("retrieved_docs", [])
     retrieved_tools = state.get("retrieved_tools", [])

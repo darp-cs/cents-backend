@@ -36,6 +36,7 @@ from app.db.base import AsyncSessionLocal
 from app.db.models import ToolDefinition
 from app.graph.checkpointer import ensure_sync_checkpointer_ready
 from app.llm.client import LLMClientError, generate_text
+from app.tools.python_runner import ToolExecutionError, execute_python_tool_code
 
 NodeExecutor = Callable[[AgentNode, SubAgentState], SubAgentState]
 ToolExecutor = Callable[[dict[str, Any], SubAgentState], Any]
@@ -1312,17 +1313,16 @@ def _execute_tool_service_call(config: ServiceCallConfig, state: SubAgentState) 
         raise RuntimeError("Referenced tool is not registered.")
 
     executor = _get_tool_executor(config, tool_definition)
-    if executor is None:
-        raise RuntimeError(
-            "No executor registered for tool reference. Register a tool executor on the server first."
-        )
-
     rendered_input = _render_template_value(config.tool_input_template, state)
     if not isinstance(rendered_input, dict):
         raise RuntimeError("Rendered tool_input_template must be a JSON object.")
     tool_input = cast(dict[str, Any], rendered_input)
+
     try:
-        result = executor(tool_input, state)
+        if executor is not None:
+            result = executor(tool_input, state)
+        else:
+            result = _execute_python_tool_definition(tool_definition, tool_input, state)
     except Exception as exc:  # pragma: no cover - defensive path around integration code.
         raise RuntimeError(f"Tool executor failed: {exc}") from exc
 
@@ -1330,8 +1330,45 @@ def _execute_tool_service_call(config: ServiceCallConfig, state: SubAgentState) 
         "mode": "tool",
         "tool_id": str(tool_definition.id),
         "tool_name": tool_definition.name,
+        "status_code": 200,
+        "body": result,
         "result": result,
     }
+
+
+def _execute_python_tool_definition(
+    tool_definition: ToolDefinition,
+    tool_input: dict[str, Any],
+    state: SubAgentState,
+) -> Any:
+    python_code = (tool_definition.python_code or "").strip()
+    if not python_code:
+        raise RuntimeError(
+            "No executor is registered for this tool and no python_code is defined in the tool record."
+        )
+
+    entrypoint = (tool_definition.python_entrypoint or "run").strip() or "run"
+    context = {
+        "tool_id": str(tool_definition.id),
+        "tool_name": tool_definition.name,
+        "state": state,
+    }
+
+    try:
+        execution_result = execute_python_tool_code(
+            python_code,
+            tool_input=tool_input,
+            context=context,
+            entrypoint=entrypoint,
+            timeout_seconds=settings.tool_code_execution_timeout_seconds,
+        )
+    except ToolExecutionError as exc:
+        traceback_text = exc.traceback_text or ""
+        if traceback_text:
+            raise RuntimeError(f"Python tool execution failed: {exc}\n{traceback_text}") from exc
+        raise RuntimeError(f"Python tool execution failed: {exc}") from exc
+
+    return execution_result.output
 
 
 def _get_tool_executor(config: ServiceCallConfig, tool_definition: ToolDefinition) -> ToolExecutor | None:
@@ -1356,13 +1393,23 @@ async def _fetch_tool_definition(tool_name: str | None, tool_id: str | None) -> 
             except ValueError as exc:
                 raise RuntimeError(f"Invalid tool_id '{tool_id}'.") from exc
 
-            result = await session.execute(select(ToolDefinition).where(ToolDefinition.id == normalized_id))
+            result = await session.execute(
+                select(ToolDefinition).where(
+                    ToolDefinition.id == normalized_id,
+                    ToolDefinition.enabled.is_(True),
+                )
+            )
             tool = result.scalar_one_or_none()
             if tool is not None:
                 return tool
 
         if tool_name:
-            result = await session.execute(select(ToolDefinition).where(ToolDefinition.name == tool_name.strip()))
+            result = await session.execute(
+                select(ToolDefinition).where(
+                    ToolDefinition.name == tool_name.strip(),
+                    ToolDefinition.enabled.is_(True),
+                )
+            )
             return result.scalar_one_or_none()
 
     return None

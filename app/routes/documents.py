@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.users import current_active_user
 from app.db.base import AsyncSessionLocal
 from app.db.models import Document, User
+from app.llm.client import LLMClientError, embed_texts
 from app.vector_store import upsert_documents
 
 router = APIRouter()
@@ -34,12 +35,30 @@ async def upload_document(
     if not chunks:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No text found in document")
 
+    bounded_chunks = [chunk[:4000] for chunk in chunks]
+
+    try:
+        chunk_embeddings = await embed_texts(
+            bounded_chunks,
+            metadata={
+                "user_id": str(user.id),
+                "entity": "document_chunk",
+            },
+        )
+    except LLMClientError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    if len(chunk_embeddings) != len(bounded_chunks):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Embedding service returned an unexpected number of vectors.",
+        )
+
     stored = []
     chroma_items: list[tuple[str, str]] = []
 
-    for chunk in chunks:
+    for chunk_text in bounded_chunks:
         doc_id = uuid.uuid4()
-        chunk_text = chunk[:4000]
         doc = Document(
             id=doc_id,
             user_id=user.id,
@@ -52,7 +71,12 @@ async def upload_document(
         stored.append({"id": doc_id_str, "source_filename": file.filename, "chunk_text": chunk_text})
 
     await session.commit()
-    upsert_documents(str(user.id), file.filename, chroma_items)
+    upsert_documents(
+        str(user.id),
+        file.filename,
+        chroma_items,
+        embeddings=chunk_embeddings,
+    )
     return {"status": "ok", "count": len(stored), "documents": stored}
 
 
