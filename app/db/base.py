@@ -73,8 +73,34 @@ def _ensure_users_columns(sync_connection) -> None:
         sync_connection.exec_driver_sql("CREATE UNIQUE INDEX ix_users_username ON users (username)")
 
 
+def _ensure_tool_definition_columns(sync_connection) -> None:
+    inspector = inspect(sync_connection)
+    if "tool_definitions" not in inspector.get_table_names():
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("tool_definitions")}
+
+    if "enabled" not in existing_columns:
+        sync_connection.exec_driver_sql(
+            "ALTER TABLE tool_definitions ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT 1"
+        )
+    if "python_code" not in existing_columns:
+        sync_connection.exec_driver_sql("ALTER TABLE tool_definitions ADD COLUMN python_code TEXT")
+    if "python_entrypoint" not in existing_columns:
+        sync_connection.exec_driver_sql(
+            "ALTER TABLE tool_definitions ADD COLUMN python_entrypoint VARCHAR(128) NOT NULL DEFAULT 'run'"
+        )
+
+    sync_connection.exec_driver_sql("UPDATE tool_definitions SET enabled = 1 WHERE enabled IS NULL")
+    sync_connection.exec_driver_sql(
+        "UPDATE tool_definitions SET python_entrypoint = 'run' "
+        "WHERE python_entrypoint IS NULL OR trim(python_entrypoint) = ''"
+    )
+
+
 async def init_db():
     _ensure_sqlite_database_path()
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
         await connection.run_sync(_ensure_users_columns)
+        await connection.run_sync(_ensure_tool_definition_columns)

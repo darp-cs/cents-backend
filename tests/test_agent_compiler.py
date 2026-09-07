@@ -941,6 +941,60 @@ def test_service_call_tool_reference_uses_registered_executor(monkeypatch: pytes
     assert result["service_results"]["call_service"]["result"]["amount"] == 120
 
 
+def test_service_call_tool_reference_executes_persisted_python_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    template_payload = {
+        "template_version": "1.0",
+        "entry_node": "call_service",
+        "nodes": [
+            {
+                "id": "call_service",
+                "type": "service_call",
+                "config": {
+                    "mode": "tool",
+                    "tool_name": "calc-tool",
+                    "tool_input_template": {"left": "{{ parsed_data.left }}", "right": "{{ parsed_data.right }}"},
+                },
+                "next": "success_response",
+            },
+            {
+                "id": "success_response",
+                "type": "terminal_response",
+                "config": {"template": "{{ service_results.call_service.result.total }}"},
+            },
+        ],
+    }
+    template = AgentTemplate.model_validate(template_payload)
+
+    async def _fake_fetch_tool_definition(tool_name: str | None, tool_id: str | None):
+        del tool_id
+        return type(
+            "ToolRow",
+            (),
+            {
+                "id": uuid.uuid4(),
+                "name": tool_name or "calc-tool",
+                "python_code": (
+                    "def run(input_data, context):\n"
+                    "    return {'total': int(input_data['left']) + int(input_data['right'])}"
+                ),
+                "python_entrypoint": "run",
+            },
+        )()
+
+    monkeypatch.setattr("app.agents.compiler._fetch_tool_definition", _fake_fetch_tool_definition)
+
+    state = _base_state()
+    state["parsed_data"] = {"left": 7, "right": 5}
+
+    compiled_graph = compile_agent_graph(template)
+    result = compiled_graph.invoke(state)
+
+    assert result["service_results"]["call_service"]["mode"] == "tool"
+    assert result["service_results"]["call_service"]["result"]["total"] == 12
+    assert result["service_results"]["call_service"]["body"]["total"] == 12
+    assert result["final_response"] == "12"
+
+
 def test_condition_node_routes_boolean_true_false() -> None:
     template_payload = {
         "template_version": "1.0",

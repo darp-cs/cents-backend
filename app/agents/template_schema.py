@@ -181,11 +181,36 @@ class Guardrails(_StrictModel):
     judge_enabled_override: bool | None = None
 
 
+class CanvasLayoutNodePosition(_StrictModel):
+    x: float
+    y: float
+
+
+class CanvasLayoutViewport(_StrictModel):
+    x: float = 0
+    y: float = 0
+    zoom: float = Field(default=1, gt=0)
+
+
+class CanvasLayout(_StrictModel):
+    node_positions: dict[str, CanvasLayoutNodePosition] = Field(default_factory=dict)
+    viewport: CanvasLayoutViewport | None = None
+
+    @field_validator("node_positions")
+    @classmethod
+    def validate_node_position_ids(cls, value: dict[str, CanvasLayoutNodePosition]) -> dict[str, CanvasLayoutNodePosition]:
+        for node_id in value:
+            if not re.match(NODE_ID_PATTERN, node_id):
+                raise ValueError(f"Invalid node id '{node_id}' in canvas_layout.node_positions.")
+        return value
+
+
 class AgentTemplate(_StrictModel):
     template_version: str = Field(pattern=TEMPLATE_VERSION_PATTERN)
     entry_node: str = Field(pattern=NODE_ID_PATTERN)
     nodes: list[AgentNode] = Field(min_length=1)
     guardrails: Guardrails = Field(default_factory=Guardrails)
+    canvas_layout: CanvasLayout | None = None
 
 
 class AgentTemplateValidationResult(BaseModel):
@@ -247,6 +272,13 @@ def _validate_graph(template: AgentTemplate) -> list[str]:
 
     if template.entry_node not in nodes_by_id:
         errors.append(f"entry_node '{template.entry_node}' does not match any node id.")
+
+    if template.canvas_layout is not None:
+        for node_id in template.canvas_layout.node_positions:
+            if node_id not in nodes_by_id:
+                errors.append(
+                    f"canvas_layout.node_positions['{node_id}'] points to unknown node id '{node_id}'."
+                )
 
     for node in template.nodes:
         for label, target in _outgoing_edges(node):

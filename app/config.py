@@ -19,10 +19,13 @@ class Settings(BaseSettings):
     llm_service_base_url: str = "http://127.0.0.1:8100"
     llm_service_generate_path: str = "/v1/generate"
     llm_service_models_path: str = "/v1/models"
+    llm_service_embeddings_path: str = "/v1/embeddings"
     llm_service_api_key: str = ""
     llm_service_timeout_seconds: int = Field(default=120, ge=5, le=600)
     llm_default_generation_model_type: str = "text-generation"
     llm_default_generation_model: str = ""
+    llm_default_embedding_model_type: str = "embedding"
+    llm_default_embedding_model: str = ""
     llm_default_judge_model_type: str = "reasoning"
     llm_default_judge_model: str = ""
     llm_judge_enabled: bool = False
@@ -32,6 +35,8 @@ class Settings(BaseSettings):
     service_call_allow_unsafe_destinations: bool = False
     service_call_default_timeout_seconds: int = Field(default=30, ge=1, le=600)
     service_call_secrets: dict[str, str] = Field(default_factory=dict)
+    tool_code_execution_timeout_seconds: int = Field(default=20, ge=1, le=120)
+    tool_code_max_length: int = Field(default=120000, ge=1000, le=1000000)
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
